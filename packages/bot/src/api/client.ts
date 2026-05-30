@@ -220,11 +220,13 @@ export class GRVTClient {
       this.tradingAccountId = creds.subAccountId;
     } else {
       // Legacy fallback: read from env.
+      // No throw here — multi-tenant deployments configure credentials
+      // via the dashboard UI (stored encrypted in DB). GRVT API calls
+      // on this singleton will fail naturally if tradingAccountId is
+      // empty; the per-bot factory (grvt-client-factory.ts) is used
+      // for all real trading ops.
       const isMockMode = process.env.MOCK_MODE === 'true' || process.env.DRY_RUN === 'true';
       this.tradingAccountId = process.env.GRVT_TRADING_ACCOUNT_ID || (isMockMode ? 'mock-account' : '');
-      if (!this.tradingAccountId) {
-        throw new Error('GRVT_TRADING_ACCOUNT_ID no encontrado en .env (set MOCK_MODE=true to bypass for development)');
-      }
     }
   }
 
