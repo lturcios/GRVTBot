@@ -27,6 +27,12 @@ COPY packages/bot/tsconfig.json packages/bot/
 
 RUN npm ci --workspace=@grvt-grid/bot --include-workspace-root
 
+# Recompile sqlite3 native bindings from source for this platform.
+# node-pre-gyp downloads a prebuilt binary by default, but prebuilts are
+# often compiled against a newer glibc than Bookworm (2.36) ships.
+# --build-from-source forces a clean compile with the local toolchain.
+RUN npm rebuild sqlite3 --build-from-source
+
 # Now copy the source and build
 COPY packages/bot/src packages/bot/src
 COPY packages/bot/tests packages/bot/tests
