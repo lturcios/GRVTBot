@@ -77,6 +77,8 @@ export interface GridBot {
   // default credentials in grvt_credentials. Non-null routes the
   // engine through that specific sub-account's encrypted creds.
   grvt_sub_account_id?: number | null;
+  // Phase 3.4: funding rate alert threshold (null = disabled)
+  alert_funding_rate_pct?: number | null;
 }
 
 export interface GridLevel {
