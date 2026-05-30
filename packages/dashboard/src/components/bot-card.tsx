@@ -1,0 +1,211 @@
+// BotCard — Overview page tile per design doc §8.1.
+// Click anywhere navigates to the bot detail page.
+
+import { Link } from 'react-router-dom';
+import { useQuery } from '@tanstack/react-query';
+import { useState } from 'react';
+import { toast } from 'sonner';
+import { Card } from './primitives/card';
+import { Mono } from './primitives/mono';
+import { StatusPill } from './primitives/status-pill';
+import { Delta } from './primitives/delta';
+import { Sparkline } from './charts/sparkline';
+import { api } from '@/lib/api-client';
+import { useWsChannel } from '@/lib/use-ws-channel';
+import {
+  formatPercent,
+  formatPnl,
+  formatSize,
+  formatUsd,
+} from '@/lib/format';
+import type { BotSummary } from '@/lib/api-types';
+import { useT } from '@/i18n';
+import { cn } from '@/lib/cn';
+
+interface BotTick {
+  status: BotSummary['status'];
+  positionSize: number;
+  avgEntryPrice: number;
+  gridProfit: number;
+  trendPnl: number;
+  totalPnl: number;
+}
+
+interface BotCardProps {
+  bot: BotSummary;
+}
+
+export function BotCard({ bot }: BotCardProps) {
+  const t = useT();
+  // Per-card WS subscription. Each card listens to its own bot:N channel
+  // so the parent (Overview / BotsList) doesn't need a hardcoded bot id
+  // or a global tick map. The hook is stable per card instance.
+  const [tick, setTick] = useState<BotTick | null>(null);
+  useWsChannel<BotTick | { botId: number; pair: string; fundingRatePct: number; thresholdPct: number }>(
+    `bot:${bot.id}`,
+    (msg) => {
+      if (msg.type === 'tick') {
+        setTick(msg.data as BotTick);
+      } else if (msg.type === 'fundingRateAlert') {
+        const d = msg.data as { botId: number; pair: string; fundingRatePct: number; thresholdPct: number };
+        toast.warning(`⚠️ Bot #${d.botId} (${d.pair}): high funding rate ${d.fundingRatePct}% — consider pausing`, {
+          duration: 10_000,
+        });
+      }
+    }
+  );
+  // Pull last 30 days of snapshots for the sparkline. Cheap query (≤30 rows).
+  const snapshots = useQuery({
+    queryKey: ['snapshots', bot.id],
+    queryFn: () => api.getSnapshots(bot.id),
+    staleTime: 5 * 60_000, // 5 min — daily snapshots only update once/day
+  });
+
+  // Market regime badge. Cached 5 min server-side; client uses same staleTime
+  // so it won't re-fetch while the server result is still fresh.
+  const marketAnalysis = useQuery({
+    queryKey: ['market-analysis', bot.id],
+    queryFn: () => api.getMarketAnalysis(bot.id),
+    staleTime: 5 * 60_000,
+    retry: false,
+  });
+
+  const sparkData = (snapshots.data?.snapshots ?? [])
+    .slice(0, 30)
+    .reverse()
+    .map((s) => ({ value: s.equity_usdt }));
+
+  const status = tick?.status ?? bot.status;
+  const totalPnl = tick?.totalPnl ?? bot.total_pnl_usdt;
+  const gridProfit = tick?.gridProfit ?? bot.grid_profit_usdt;
+  const trendPnl = tick?.trendPnl ?? bot.trend_pnl_usdt;
+  const positionSize = tick?.positionSize ?? bot.position_size;
+  const avgEntry = tick?.avgEntryPrice ?? bot.avg_entry_price;
+  const equity = bot.investment_usdt + totalPnl;
+  const equityPct = (totalPnl / bot.investment_usdt) * 100;
+
+  return (
+    <Link
+      to={`/bots/${bot.id}`}
+      // The Link itself gets no outline because we move the focus indicator
+      // to the Card border below — more on-style. The global *:focus-visible
+      // rule in globals.css would otherwise paint a primary outline outside
+      // the card border, which clashes with the rounded corners.
+      className="block hover:no-underline focus-visible:outline-none focus-visible:[&_div[data-card]]:border-primary"
+      aria-label={`Open bot ${bot.id} ${bot.pair} ${bot.direction} ${bot.leverage}x`}
+    >
+      <Card
+        data-card
+        className="hover:border-border-default cursor-pointer p-5 transition-colors"
+      >
+        {/* Header */}
+        <div className="flex items-start justify-between mb-3">
+          <div>
+            <h3 className="text-base font-semibold text-text-primary">
+              {bot.pair}
+            </h3>
+            <p className="text-2xs uppercase tracking-wider text-text-muted mt-0.5">
+              {bot.direction} · {bot.leverage}x
+            </p>
+          </div>
+          <div className="flex items-center gap-1.5">
+            {marketAnalysis.data && (
+              <RegimeBadge
+                regime={marketAnalysis.data.regime}
+                atrPct={marketAnalysis.data.atrPct}
+                suggestedLower={marketAnalysis.data.suggestedLower}
+                suggestedUpper={marketAnalysis.data.suggestedUpper}
+                candlesUsed={marketAnalysis.data.candlesUsed}
+              />
+            )}
+            <StatusPill status={status} />
+          </div>
+        </div>
+
+        {/* Equity hero */}
+        <div className="mb-1">
+          <span className="text-2xs uppercase tracking-wider text-text-muted">
+            {t('bots.cardEquity')}
+          </span>
+        </div>
+        <div className="flex items-baseline gap-3 mb-2">
+          <Mono className="text-2xl font-semibold text-text-primary">
+            {formatUsd(equity)}
+          </Mono>
+          <Delta value={equityPct} format={formatPercent} />
+        </div>
+
+        {/* Sparkline */}
+        <div className="mb-4">
+          <Sparkline data={sparkData} />
+        </div>
+
+        {/* Stats grid */}
+        <dl className="grid grid-cols-2 gap-x-4 gap-y-2 text-xs">
+          <SummaryRow
+            label={t('bots.cardPosition')}
+            value={`${formatSize(positionSize)} @ ${formatUsd(avgEntry)}`}
+          />
+          <SummaryRow
+            label={t('bots.cardRange')}
+            value={`${formatUsd(bot.lower_price)}–${formatUsd(bot.upper_price)}`}
+          />
+          <SummaryRow label={t('bots.cardGrids')} value={t('bots.cardLevels', { n: bot.num_grids })} />
+          <SummaryRow label={t('bots.cardRealized')} value={formatPnl(gridProfit)} />
+          <SummaryRow label={t('bots.cardUnrealized')} value={formatPnl(trendPnl)} />
+          <SummaryRow label={t('bots.cardInvestment')} value={formatUsd(bot.investment_usdt)} />
+        </dl>
+      </Card>
+    </Link>
+  );
+}
+
+function SummaryRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex flex-col gap-0.5">
+      <dt className="text-2xs uppercase tracking-wider text-text-muted">
+        {label}
+      </dt>
+      <dd className="font-mono tabular-nums text-text-secondary truncate">
+        {value}
+      </dd>
+    </div>
+  );
+}
+
+function RegimeBadge({
+  regime,
+  atrPct,
+  suggestedLower,
+  suggestedUpper,
+  candlesUsed,
+}: {
+  regime: 'ranging' | 'trending_up' | 'trending_down';
+  atrPct: number;
+  suggestedLower: number;
+  suggestedUpper: number;
+  candlesUsed: number;
+}) {
+  const label =
+    regime === 'ranging' ? 'RANGING' : regime === 'trending_up' ? '↑ TREND' : '↓ TREND';
+  const colorClass =
+    regime === 'ranging'
+      ? 'bg-success/15 text-success border-success/30'
+      : regime === 'trending_up'
+      ? 'bg-warning/15 text-warning border-warning/30'
+      : 'bg-danger/15 text-danger border-danger/30';
+
+  const tooltip = `ATR: ${atrPct.toFixed(2)}% · Suggested range: ${suggestedLower.toFixed(0)}–${suggestedUpper.toFixed(0)} · ${candlesUsed} candles`;
+
+  return (
+    <span
+      title={tooltip}
+      className={cn(
+        'inline-flex items-center rounded border px-1.5 py-0.5 text-2xs font-semibold tracking-wide cursor-default',
+        colorClass
+      )}
+    >
+      {label}
+    </span>
+  );
+}
