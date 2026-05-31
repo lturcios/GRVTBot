@@ -303,18 +303,17 @@ export async function authenticateWithKey(
       const errBody = await response.text().catch(() => '');
       throw new Error(`GRVT login rejected (HTTP ${response.status})${errBody ? ': ' + errBody : ''}`);
     }
-    // Diagnostic: log full headers + body so we can detect API format changes
+    // GRVT returns HTTP 200 even for access-denied errors — must check body too.
     const responseBody = await response.text().catch(() => '');
-    const allHeaders = Object.fromEntries(response.headers.entries());
-    console.log('[GRVT auth] login response headers:', JSON.stringify(allHeaders));
-    console.log('[GRVT auth] login response body:', responseBody);
+    let parsed: { status?: string; error?: string } = {};
+    try { parsed = JSON.parse(responseBody); } catch { /* not JSON */ }
+    if (parsed.status === 'failure' || parsed.error) {
+      throw new Error(`GRVT login rejected: ${parsed.error ?? responseBody}`);
+    }
     const setCookie = response.headers.get('set-cookie');
     const accountId = response.headers.get('x-grvt-account-id');
     if (!setCookie || !accountId) {
-      throw new Error(
-        `GRVT login: missing gravity cookie or account-id in response. ` +
-        `Headers: ${JSON.stringify(allHeaders)}. Body: ${responseBody}`
-      );
+      throw new Error('GRVT login: missing gravity cookie or account-id in response');
     }
     const gravityMatch = setCookie.match(/gravity=([^;]+)/);
     if (!gravityMatch?.[1]) {
