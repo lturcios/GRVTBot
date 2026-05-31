@@ -23,7 +23,7 @@ import { signToken, verifyToken } from '../auth/jwt.js';
 import { encryptCredentialFields } from '../auth/crypto.js';
 import { sendPasswordResetEmail, isMailerConfigured } from '../mail/mailer.js';
 import { GRVTClient, type GrvtClientCreds } from '../api/client.js';
-import { invalidateGrvtClient } from '../api/grvt-client-factory.js';
+import { invalidateGrvtClient, getGrvtClientForUser } from '../api/grvt-client-factory.js';
 import { calculateATR, detectMarketRegime, suggestGridSpacing } from '../bot/market-analysis.js';
 
 // Augment Express Request to carry the authenticated user id and jti
@@ -1196,11 +1196,19 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
       ORDER BY level_index
     `, [id]);
 
-    // Live data from GRVT (cached 2s).
+    // Live data from GRVT. Ticker is public (no auth needed). Position and
+    // open orders require the per-user factory client so multi-tenant
+    // deployments don't fall back to the legacy env-var singleton path.
+    const userId = req.userId!;
+    const userClientPromise = getGrvtClientForUser(userId, gridBotDb).catch(() => null);
     const [ticker, position, openOrders] = await Promise.all([
       cache.getOrFetch(`ticker:${bot.pair}`, 2_000, () => grvtClient.getTicker(bot.pair)),
-      cache.getOrFetch(`position:${bot.pair}`, 2_000, () => grvtClient.getPosition(bot.pair)),
-      cache.getOrFetch(`openOrders:${bot.pair}`, 2_000, () => grvtClient.getOpenOrders(bot.pair))
+      userClientPromise.then(c => c
+        ? cache.getOrFetch(`position:${bot.pair}:${userId}`, 2_000, () => c.getPosition(bot.pair))
+        : null),
+      userClientPromise.then(c => c
+        ? cache.getOrFetch(`openOrders:${bot.pair}:${userId}`, 2_000, () => c.getOpenOrders(bot.pair))
+        : []),
     ]);
 
     res.json({
