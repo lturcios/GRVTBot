@@ -299,12 +299,19 @@ export async function authenticateWithKey(
       },
       body: JSON.stringify({ api_key: apiKey }),
     });
-    if (!response.ok) return false;
+    if (!response.ok) {
+      const errBody = await response.text().catch(() => '');
+      throw new Error(`GRVT login rejected (HTTP ${response.status})${errBody ? ': ' + errBody : ''}`);
+    }
     const setCookie = response.headers.get('set-cookie');
     const accountId = response.headers.get('x-grvt-account-id');
-    if (!setCookie || !accountId) return false;
+    if (!setCookie || !accountId) {
+      throw new Error('GRVT login: missing gravity cookie or account-id in response');
+    }
     const gravityMatch = setCookie.match(/gravity=([^;]+)/);
-    if (!gravityMatch?.[1]) return false;
+    if (!gravityMatch?.[1]) {
+      throw new Error('GRVT login: gravity cookie not found in Set-Cookie header');
+    }
     const now = Date.now();
     state.gravityCookie = gravityMatch[1];
     state.accountId = accountId;
@@ -312,9 +319,9 @@ export async function authenticateWithKey(
     state.expiresAt = now + 23 * 60 * 60 * 1000;
     state.loginTime = now;
     return true;
-  } catch {
+  } catch (err) {
     state.isAuthenticated = false;
-    return false;
+    throw err;
   }
 }
 

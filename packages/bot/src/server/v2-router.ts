@@ -880,15 +880,7 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
     let testEquity: string | null = null;
     try {
       const testClient = new GRVTClient(plainCreds);
-      const loggedIn = await testClient.login();
-      if (!loggedIn) {
-        log.warn({ userId }, 'GRVT credential test: login returned false');
-        return res.status(400).json({
-          error: 'credential_test_failed',
-          stage: 'login',
-          message: 'GRVT login failed — check apiKey and apiSecret',
-        });
-      }
+      await testClient.login();
       // Authenticated round-trip — validates accountId/subAccountId too.
       const balance = await testClient.getBalance();
       testEquity = balance.total_equity ?? null;
@@ -898,8 +890,8 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
       log.warn({ userId, err: msg }, 'GRVT credential test: failed');
       return res.status(400).json({
         error: 'credential_test_failed',
-        stage: 'account_summary',
-        message: `GRVT API call failed: ${msg}`,
+        stage: 'login',
+        message: msg,
       });
     }
 
