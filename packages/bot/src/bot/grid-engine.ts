@@ -1493,8 +1493,8 @@ export class GridEngine extends EventEmitter {
 
           for (const payment of newPayments) {
             try {
-              // Convertir payment de raw a USDT (÷ 1e6)
-              const paymentUsdt = parseFloat(payment.payment) / 1e6;
+              // payment already in USDT (returned by client.ts from cumulative_realized_funding_payment)
+              const paymentUsdt = parseFloat(payment.payment);
 
               const fundingRate = parseFloat(payment.funding_rate);
               await db.createFundingRecord({
@@ -1581,8 +1581,8 @@ export class GridEngine extends EventEmitter {
                 continue; // Ya existe, skip
               }
 
-              // Convertir payment de raw a USDT (÷ 1e6)
-              const paymentUsdt = parseFloat(payment.payment) / 1e6;
+              // payment already in USDT (returned by client.ts from cumulative_realized_funding_payment)
+              const paymentUsdt = parseFloat(payment.payment);
 
               await db.createFundingRecord({
                 bot_id: bot.id,
