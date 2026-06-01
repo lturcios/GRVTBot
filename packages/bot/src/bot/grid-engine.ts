@@ -1479,49 +1479,45 @@ export class GridEngine extends EventEmitter {
           const fundingPayments = await client.getFundingHistory(50, bot.pair);
           log.info(`💰 [DEBUG] Bot ${bot.id}: ${fundingPayments.length} funding payments`);
 
-          // Obtener último funding time registrado para evitar duplicados
+          if (fundingPayments.length === 0) continue;
+
+          // account_summary returns a single cumulative snapshot (not per-interval events).
+          // We compute the delta vs the sum of stored records so that SUM(payment_usdt)
+          // always equals the running cumulative total, and no duplicate rows are created
+          // when the cumulative hasn't changed.
+          const payment = fundingPayments[0]!;
+          const currentCumulative = parseFloat(payment.payment); // already in USDT
+
           const existingFunding = await db.getFundingHistoryByBot(bot.id);
-          const lastFundingTime = existingFunding.length > 0 ?
-            new Date(existingFunding[0]!.funding_time).getTime() : 0;
+          const storedTotal = existingFunding.reduce((sum, r) => sum + r.payment_usdt, 0);
 
-          // Filtrar nuevos payments
-          const newPayments = fundingPayments.filter(payment =>
-            payment.funding_time * 1000 > lastFundingTime
-          );
+          const deltaUsdt = currentCumulative - storedTotal;
+          if (deltaUsdt < 1e-8) {
+            log.info(`💰 [DEBUG] Bot ${bot.id}: funding sin cambios (${currentCumulative.toFixed(6)} USDT acumulado)`);
+            continue;
+          }
 
-          log.info(`💰 [DEBUG] Bot ${bot.id}: ${newPayments.length} nuevos funding payments`);
+          const fundingRate = parseFloat(payment.funding_rate);
+          await db.createFundingRecord({
+            bot_id: bot.id,
+            instrument: bot.pair,
+            funding_rate: fundingRate,
+            payment_usdt: deltaUsdt,
+            position_size: parseFloat(payment.position_size),
+            funding_time: new Date(payment.funding_time * 1000).toISOString()
+          });
 
-          for (const payment of newPayments) {
-            try {
-              // payment already in USDT (returned by client.ts from cumulative_realized_funding_payment)
-              const paymentUsdt = parseFloat(payment.payment);
+          log.info(`💰 [DEBUG] Funding registrado para bot ${bot.id}: ${deltaUsdt.toFixed(6)} USDT (acumulado: ${currentCumulative.toFixed(6)})`);
 
-              const fundingRate = parseFloat(payment.funding_rate);
-              await db.createFundingRecord({
-                bot_id: bot.id,
-                instrument: bot.pair,
-                funding_rate: fundingRate,
-                payment_usdt: paymentUsdt,
-                position_size: parseFloat(payment.position_size),
-                funding_time: new Date(payment.funding_time * 1000).toISOString()
-              });
-
-              log.info(`💰 [DEBUG] Funding registrado para bot ${bot.id}: ${paymentUsdt.toFixed(4)} USDT`);
-
-              // Emit alert if the absolute rate exceeds the per-bot threshold.
-              const threshold = bot.alert_funding_rate_pct;
-              if (threshold != null && Math.abs(fundingRate) * 100 > threshold) {
-                this.emit('fundingRateAlert', {
-                  botId: bot.id,
-                  pair: bot.pair,
-                  fundingRatePct: Math.round(fundingRate * 100 * 10000) / 10000,
-                  thresholdPct: threshold,
-                });
-              }
-
-            } catch (fundingErr) {
-              log.error({ err: (fundingErr as Error).message }, `❌ Error registrando funding para bot ${bot.id}:`);
-            }
+          // Emit alert if the absolute rate exceeds the per-bot threshold.
+          const threshold = bot.alert_funding_rate_pct;
+          if (threshold != null && Math.abs(fundingRate) * 100 > threshold) {
+            this.emit('fundingRateAlert', {
+              botId: bot.id,
+              pair: bot.pair,
+              fundingRatePct: Math.round(fundingRate * 100 * 10000) / 10000,
+              thresholdPct: threshold,
+            });
           }
 
           // Throttle between bots
@@ -1553,52 +1549,40 @@ export class GridEngine extends EventEmitter {
       }
 
       // Multi-tenant: one backfill per bot, using the owner's client.
+      // Uses the same delta logic as pollFundingHistory: account_summary only
+      // returns the current cumulative, so we store the delta vs the stored total.
       for (const bot of allBots) {
         try {
           log.info(`🔄 [DEBUG] Backfill funding para bot ${bot.id} (${bot.pair})...`);
 
           const client = await this.getClientForBot(bot);
-          // Obtener todo el funding history disponible (últimos 500)
           const allFunding = await client.getFundingHistory(500, bot.pair);
-          log.info(`🔄 [DEBUG] Bot ${bot.id}: total funding history disponible: ${allFunding.length}`);
+          log.info(`🔄 [DEBUG] Bot ${bot.id}: funding snapshot disponible: ${allFunding.length}`);
 
-          const botCreatedTime = new Date(bot.created_at).getTime();
+          if (allFunding.length === 0) continue;
 
-          // Filtrar funding después de la creación del bot
-          const relevantFunding = allFunding.filter(payment =>
-            payment.funding_time * 1000 >= botCreatedTime
-          );
+          const payment = allFunding[0]!;
+          const currentCumulative = parseFloat(payment.payment); // already in USDT
 
-          log.info(`🔄 [DEBUG] Bot ${bot.id}: ${relevantFunding.length} funding payments relevantes`);
+          const existingFunding = await db.getFundingHistoryByBot(bot.id);
+          const storedTotal = existingFunding.reduce((sum, r) => sum + r.payment_usdt, 0);
 
-          for (const payment of relevantFunding) {
-            try {
-              // Verificar si ya existe este funding
-              const existing = await db.getFundingHistoryByBot(bot.id);
-              const fundingTimeStr = new Date(payment.funding_time * 1000).toISOString();
-
-              if (existing.some(f => f.funding_time === fundingTimeStr)) {
-                continue; // Ya existe, skip
-              }
-
-              // payment already in USDT (returned by client.ts from cumulative_realized_funding_payment)
-              const paymentUsdt = parseFloat(payment.payment);
-
-              await db.createFundingRecord({
-                bot_id: bot.id,
-                instrument: bot.pair,
-                funding_rate: parseFloat(payment.funding_rate),
-                payment_usdt: paymentUsdt,
-                position_size: parseFloat(payment.position_size),
-                funding_time: fundingTimeStr
-              });
-
-            } catch (recordErr) {
-              log.error({ err: (recordErr as Error).message }, `❌ Error registrando funding record:`);
-            }
+          const deltaUsdt = currentCumulative - storedTotal;
+          if (deltaUsdt < 1e-8) {
+            log.info(`🔄 [DEBUG] Bot ${bot.id}: funding ya up-to-date (${currentCumulative.toFixed(6)} USDT acumulado)`);
+            continue;
           }
 
-          log.info(`🔄 [DEBUG] Backfill completado para bot ${bot.id}`);
+          await db.createFundingRecord({
+            bot_id: bot.id,
+            instrument: bot.pair,
+            funding_rate: parseFloat(payment.funding_rate),
+            payment_usdt: deltaUsdt,
+            position_size: parseFloat(payment.position_size),
+            funding_time: new Date(payment.funding_time * 1000).toISOString()
+          });
+
+          log.info(`🔄 [DEBUG] Backfill bot ${bot.id}: ${deltaUsdt.toFixed(6)} USDT registrado (acumulado: ${currentCumulative.toFixed(6)})`);
 
           // Throttle between bots
           await new Promise(r => setTimeout(r, 2000));
