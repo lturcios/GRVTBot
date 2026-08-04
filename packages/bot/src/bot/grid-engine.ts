@@ -2667,11 +2667,15 @@ export class GridBotInstance {
         // Esperar 1 segundo para que GRVT procese
         await new Promise(r => setTimeout(r, 1000));
         
-        // Buscar la orden por precio en open_orders
+        // Buscar la orden por precio en open_orders.
+        // Tolerance must be well below the minimum grid gap (e.g. $0.02 for XRP)
+        // to avoid matching a neighbour's order and producing a duplicate order_id
+        // UNIQUE constraint in the DB.
         const openOrders = await this.grvt.getOpenOrders(this.bot.pair);
         const match = openOrders.find((o: any) => {
           const orderPrice = o.legs?.[0]?.limit_price ? parseFloat(o.legs[0].limit_price) : 0;
-          return Math.abs(orderPrice - level.price) < 1.0;
+          const isSameSide = o.legs?.[0]?.is_buying_asset === (level.side === 'buy');
+          return isSameSide && Math.abs(orderPrice - level.price) < 0.001;
         });
         if (match) {
           realOrderId = match.order_id;
