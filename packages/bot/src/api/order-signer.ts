@@ -114,7 +114,9 @@ function sizeToContractSize(size: string, instrument: string): string {
  * ⚠️ CRÍTICO: SIEMPRE usar PRICE_MULTIPLIER = 1e9 (no quote_decimals)
  */
 function roundToTickSize(price: number, tickSize: number = 0.01): number {
-  return Math.floor(price / tickSize) * tickSize;
+  // Math.round avoids the floating-point trap: 1.14 / 0.01 = 113.9999...
+  // which Math.floor would turn into 113 → 1.13, the wrong tick.
+  return Math.round(price / tickSize) * tickSize;
 }
 
 function priceToLimitPrice(price: string, tickSize: number = 0.01): string {

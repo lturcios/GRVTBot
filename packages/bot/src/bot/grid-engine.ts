@@ -2675,17 +2675,6 @@ export class GridBotInstance {
         // Do NOT filter by is_buying_asset: GRVT may omit that field or encode it
         // differently in open_orders responses.
         const openOrders = await this.grvt.getOpenOrders(this.bot.pair);
-        // DEBUG: log the raw open_orders data so we can see the actual price format
-        log.info(`[0x00 DEBUG] open_orders count: ${openOrders.length}, target: $${level.price} (${level.side})`);
-        if (openOrders.length > 0) {
-          const sample = openOrders.slice(0, 5).map((o: any) => ({
-            id: (o.order_id ?? '').slice(0, 12),
-            lp: o.legs?.[0]?.limit_price,
-            price: o.price,
-            side: o.side ?? o.legs?.[0]?.is_buying_asset,
-          }));
-          log.info({ sample }, '[0x00 DEBUG] first open_orders entries');
-        }
         const match = openOrders.find((o: any) => {
           const orderPrice = o.legs?.[0]?.limit_price ? parseFloat(o.legs[0].limit_price) : 0;
           return Math.abs(orderPrice - level.price) < 0.005;
