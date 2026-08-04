@@ -163,7 +163,7 @@ export interface RangeUpdateInputs {
   positionReadError?: string;
 }
 
-const MAX_AUTO_BUY_ETH = 2.0;
+const MAX_AUTO_BUY_USDT = 200;
 const MIN_LOWER_DISTANCE_PCT = 0.5;
 const MAX_UPPER_DISTANCE_PCT = 2.0;
 const AUTO_BUY_SLIPPAGE_PCT = 0.5;
@@ -220,9 +220,9 @@ export function computeRangeUpdatePlan(input: RangeUpdateInputs): RangeUpdatePla
   const ethDeficit = Math.max(0, ethNeeded - currentPosition);
   const ethExcess = Math.max(0, currentPosition - ethNeeded);
 
-  if (ethDeficit > MAX_AUTO_BUY_ETH) {
+  if (ethDeficit * currentPrice > MAX_AUTO_BUY_USDT) {
     safetyViolations.push(
-      `Auto-buy deficit ${ethDeficit.toFixed(4)} ETH exceeds safety cap of ${MAX_AUTO_BUY_ETH} ETH`
+      `Auto-buy cost ~$${(ethDeficit * currentPrice).toFixed(2)} exceeds safety cap of $${MAX_AUTO_BUY_USDT}`
     );
   }
 
@@ -1746,7 +1746,7 @@ export class GridEngine extends EventEmitter {
   //   updates bot.lower_price / upper_price. Releases mutex in finally.
   //
   // Safety caps (hard, non-overrideable from the API layer):
-  //   MAX_AUTO_BUY_ETH        = 2.0   ETH absolute cap on market buy
+  //   MAX_AUTO_BUY_USDT       = 200   USDT cap on auto-buy cost (pair-agnostic)
   //   MAX_RANGE_DRIFT_PCT     = 50%   |new mid - current price| cap
   //   MIN_LOWER_DISTANCE_PCT  = 50%   newLower must be ≥ 0.5 × current
   //   MAX_UPPER_DISTANCE_PCT  = 200%  newUpper must be ≤ 2.0 × current
@@ -3611,12 +3611,12 @@ export class GridBotInstance {
       // Obtener precio actual de ETH
       let ethPrice: number | null = null;
       try {
-        const tickers = await this.grvt.getTickers(['ETH_USDT_Perp']);
+        const tickers = await this.grvt.getTickers([this.bot.pair]);
         if (tickers && tickers.length > 0 && tickers[0]?.last_price) {
           ethPrice = parseFloat(tickers[0].last_price);
         }
       } catch (e) {
-        log.warn('⚠️ No se pudo obtener precio de ETH para snapshot');
+        log.warn('⚠️ No se pudo obtener precio de par para snapshot');
       }
       
       // Crear snapshot para el bot actual
