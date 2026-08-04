@@ -22,7 +22,7 @@ import { hashPassword, verifyPassword } from '../auth/passwords.js';
 import { signToken, verifyToken } from '../auth/jwt.js';
 import { encryptCredentialFields } from '../auth/crypto.js';
 import { sendPasswordResetEmail, isMailerConfigured } from '../mail/mailer.js';
-import { GRVTClient, type GrvtClientCreds } from '../api/client.js';
+import { GRVTClient, getInstrumentSpec, type GrvtClientCreds } from '../api/client.js';
 import { invalidateGrvtClient, getGrvtClientForUser } from '../api/grvt-client-factory.js';
 import { calculateATR, detectMarketRegime, suggestGridSpacing } from '../bot/market-analysis.js';
 
@@ -1901,17 +1901,16 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
     const ORDER_ALLOC = 0.75;
     const midPrice = (upper + lower) / 2;
     const effCap = investment * leverage * ORDER_ALLOC;
-    const minSize = pair === 'ETH_USDT_Perp' ? 0.01 : 0.001;
+    const { min_size: minSize, min_notional: minNotional } = getInstrumentSpec(pair);
     let qtyPerLevel = Math.max(
-      Math.ceil((effCap / grids / midPrice) * 100) / 100,
-      0.03
+      Math.ceil((effCap / grids / midPrice) / minSize) * minSize,
+      minSize
     );
     // Floor on min notional at the lower price (safety net; usually no-op).
-    const minNotional = pair === 'ETH_USDT_Perp' ? 20 : 100;
     while (qtyPerLevel * lower < minNotional) {
       qtyPerLevel += minSize;
     }
-    qtyPerLevel = Math.round(qtyPerLevel * 100) / 100;
+    qtyPerLevel = Math.round(qtyPerLevel / minSize) * minSize;
     const profitPerRoundTrip = qtyPerLevel * spacing;
 
     // Estimated liquidation: simplified — actual depends on funding/fees.
