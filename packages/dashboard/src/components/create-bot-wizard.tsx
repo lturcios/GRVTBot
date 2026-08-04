@@ -959,7 +959,7 @@ function BacktestPreview({
         <div>
           <div className="text-2xs text-text-muted">Profit Factor</div>
           <div className="text-xs font-mono font-semibold text-text-primary">
-            {backtest.profitFactor.toFixed(2)}x
+            {backtest.profitFactor != null ? `${backtest.profitFactor.toFixed(2)}x` : '—'}
           </div>
         </div>
       </div>
