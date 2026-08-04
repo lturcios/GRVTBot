@@ -85,16 +85,27 @@ function generateExpiration(hours: number = 24): string {
 // ⚠️ Función assetIdToUint256 removida - ya no se necesita
 
 /**
+ * Round a size to the instrument's min_size and return a properly-formatted
+ * string with the exact number of decimal places.  Both the EIP-712 signature
+ * (contractSize) and the HTTP payload `size` field must use this same rounded
+ * value — otherwise GRVT's verification produces a different contractSize and
+ * rejects the order with "Signature does not match payload".
+ */
+function roundedSizeString(size: string, instrument: string): string {
+  const spec = getInstrumentSpec(instrument);
+  const minS = spec.min_size;
+  const sizeNum = Math.floor(parseFloat(size) / minS) * minS;
+  const decPlaces = (minS.toString().split('.')[1] ?? '').length;
+  return sizeNum.toFixed(decPlaces);
+}
+
+/**
  * Convertir size a contract size en base units
  * ⚠️ ACTUALIZADO: usar base_decimals del instrumento
  */
 function sizeToContractSize(size: string, instrument: string): string {
-  // Round to min_size before computing contractSize
-  const spec = getInstrumentSpec(instrument);
-  const minSize = spec.min_size;
-  const sizeNum = Math.floor(parseFloat(size) / minSize) * minSize;
   const baseDecimals = getBaseDecimals(instrument);
-  const contractSize = Math.round(sizeNum * Math.pow(10, baseDecimals));
+  const contractSize = Math.round(parseFloat(roundedSizeString(size, instrument)) * Math.pow(10, baseDecimals));
   return contractSize.toString();
 }
 
@@ -328,7 +339,7 @@ export function formatSignedOrderForAPI(signedOrder: SignedOrder, instrument: st
       legs: [
         {
           instrument: instrument, // ⚠️ CAMBIO: human-readable name
-          size: roundPrice(size, 0.01), // ⚠️ Rounded to min_size
+          size: roundedSizeString(size, instrument), // must match what sizeToContractSize signed
           limit_price: signedOrder.isMarket ? undefined : roundPrice(price!), // ⚠️ Rounded to tick_size
           is_buying_asset: leg.isBuyingContract, // ⚠️ CAMBIO: is_buying_asset
         },
