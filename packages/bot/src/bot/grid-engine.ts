@@ -2887,7 +2887,7 @@ export class GridBotInstance {
       // Closest uncovered = natural gap
       const gap = uncoveredLevels[0]!;
       log.info(`🕳️ Gap: $${gap.level.price} (dist=$${gap.dist.toFixed(2)})`);
-      await db.updateGridLevel(gap.level.id, { is_filled: true, order_id: '' });
+      await db.updateGridLevel(gap.level.id, { is_filled: true, state: 'filled', order_id: '' });
     }
     
     if (uncoveredLevels.length > 1 && openOrders.length < 94) {
@@ -3043,7 +3043,7 @@ export class GridBotInstance {
       if (counterLevel.order_id && counterLevel.order_id !== '0x00' && counterLevel.order_id !== '0x0000000000000000000000000000000000000000000000000000000000000000' && !counterLevel.is_filled) {
         log.info(`⚠️ Counter level ${counterLevelIndex} @ $${counterLevel.price} already has order ${counterLevel.order_id}, skipping duplicate`);
         // Solo marcar el filled level como filled
-        await db.updateGridLevel(level.id, { is_filled: true });
+        await db.updateGridLevel(level.id, { is_filled: true, state: 'filled' });
         continue;
       }
       
