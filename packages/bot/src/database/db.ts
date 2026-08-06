@@ -1345,22 +1345,15 @@ export class GridBotDB {
    * Crear snapshot diario
    */
   async createDailySnapshot(params: Omit<DailySnapshot, 'id' | 'created_at'>): Promise<number> {
-    const ts = new Date(params.date + 'T00:00:00Z').toISOString();
     const result = await this.dbRun(`
       INSERT OR REPLACE INTO daily_snapshots
-      (bot_id, date, timestamp, equity, balance_usdt, equity_usdt,
-       grid_profit_net, grid_profit_usdt, trend_pnl, trend_pnl_usdt,
-       total_pnl, total_pnl_usdt, round_trips, num_round_trips,
-       eth_price, position_size, drawdown_pct)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)
+      (bot_id, date, equity, grid_profit_net, trend_pnl, total_pnl, round_trips, eth_price)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `, [
-      params.bot_id, params.date, ts,
-      params.equity, params.equity, params.equity,
-      params.grid_profit_net, params.grid_profit_net,
-      params.trend_pnl, params.trend_pnl,
-      params.total_pnl, params.total_pnl,
-      params.round_trips, params.round_trips,
-      params.eth_price,
+      params.bot_id, params.date,
+      params.equity, params.grid_profit_net,
+      params.trend_pnl, params.total_pnl,
+      params.round_trips, params.eth_price,
     ]);
 
     return result.lastID!;
