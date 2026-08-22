@@ -220,16 +220,25 @@ export function computeRangeUpdatePlan(input: RangeUpdateInputs): RangeUpdatePla
   const ethDeficit = Math.max(0, ethNeeded - currentPosition);
   const ethExcess = Math.max(0, currentPosition - ethNeeded);
 
-  if (ethDeficit * currentPrice > MAX_AUTO_BUY_USDT) {
+  // A nonzero deficit smaller than the instrument's min_size can never be
+  // filled as-is — GRVT rejects the order outright, which used to make
+  // auto-shift fail forever on pairs like XRP (min_size 0.1) whenever the
+  // deficit landed under that floor. Round the actual buy order up to
+  // min_size; the small resulting excess is absorbed by the grid the same
+  // way ethExcess already is.
+  const { min_size: autoBuyMinSize } = getInstrumentSpec(bot.pair);
+  const autoBuySize = ethDeficit > 0 ? Math.max(ethDeficit, autoBuyMinSize) : 0;
+
+  if (autoBuySize * currentPrice > MAX_AUTO_BUY_USDT) {
     safetyViolations.push(
-      `Auto-buy cost ~$${(ethDeficit * currentPrice).toFixed(2)} exceeds safety cap of $${MAX_AUTO_BUY_USDT}`
+      `Auto-buy cost ~$${(autoBuySize * currentPrice).toFixed(2)} exceeds safety cap of $${MAX_AUTO_BUY_USDT}`
     );
   }
 
   const autoBuyAggressivePrice =
     Math.ceil(currentPrice * (1 + AUTO_BUY_SLIPPAGE_PCT / 100) * 100) / 100;
-  const autoBuyEstimatedCost = ethDeficit * autoBuyAggressivePrice;
-  const autoBuySlippageCostUsd = ethDeficit * currentPrice * (AUTO_BUY_SLIPPAGE_PCT / 100);
+  const autoBuyEstimatedCost = autoBuySize * autoBuyAggressivePrice;
+  const autoBuySlippageCostUsd = autoBuySize * currentPrice * (AUTO_BUY_SLIPPAGE_PCT / 100);
 
   const ordersToCancel = existingLevels
     .filter((l) =>
@@ -241,7 +250,7 @@ export function computeRangeUpdatePlan(input: RangeUpdateInputs): RangeUpdatePla
   if (noop) warnings.push('Range unchanged — this is a no-op');
   if (ethDeficit > 0) {
     warnings.push(
-      `Will market-buy ${ethDeficit.toFixed(4)} ETH at ~$${autoBuyAggressivePrice} (~$${autoBuyEstimatedCost.toFixed(2)} total, ~$${autoBuySlippageCostUsd.toFixed(2)} slippage)`
+      `Will market-buy ${autoBuySize.toFixed(4)} ETH at ~$${autoBuyAggressivePrice} (~$${autoBuyEstimatedCost.toFixed(2)} total, ~$${autoBuySlippageCostUsd.toFixed(2)} slippage)`
     );
   }
   if (ethExcess > 0) {
@@ -267,7 +276,7 @@ export function computeRangeUpdatePlan(input: RangeUpdateInputs): RangeUpdatePla
     autoBuy:
       ethDeficit > 0
         ? {
-            size: ethDeficit,
+            size: autoBuySize,
             estimatedPrice: autoBuyAggressivePrice,
             estimatedCost: autoBuyEstimatedCost,
             slippagePct: AUTO_BUY_SLIPPAGE_PCT,
@@ -1238,6 +1247,13 @@ export class GridEngine extends EventEmitter {
         });
         log.info({ botId, newLower, newUpper }, 'auto-shift completed');
       } catch (shiftErr) {
+        // Stamp last_auto_shift_at even on failure — otherwise a
+        // deterministic failure (e.g. a safety violation that won't
+        // change until price moves) retries on every monitor tick
+        // instead of backing off for the usual hour.
+        await db.updateBot(botId, { last_auto_shift_at: Date.now() });
+        const freshBot = await db.getBot(botId);
+        if (freshBot) instance.refreshBot(freshBot);
         log.warn(
           { botId, err: (shiftErr as Error).message },
           'auto-shift failed (safety violation or error)'
