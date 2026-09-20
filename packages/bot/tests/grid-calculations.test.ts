@@ -80,7 +80,70 @@ vi.mock('../src/server/logger.js', () => ({
   }),
 }));
 
-import { computeLiqPriceLocal, GridEngine } from '../src/bot/grid-engine.js';
+import { computeLiqPriceCross, computeLiqPriceLocal, GridEngine } from '../src/bot/grid-engine.js';
+
+// ── 1b. computeLiqPriceCross ─────────────────────────────────────────
+// Cross-margin liquidation from real account state. The case that
+// motivated it: bot 5 (XRP long) had grown to 244.1 units on ~106 USDT
+// of equity — ~2.9x effective against a declared 2x — so the local
+// estimate put liquidation 20 points of price further away than it was.
+
+describe('computeLiqPriceCross', () => {
+  it('LONG: solves equity(P) = maintenance(P)', () => {
+    // 244.1 @ mark 1.40 = 341.74 notional, equity 106.52, flat 0.5% mm
+    // → (341.74 - 106.52) / (244.1 * 0.995) = 0.9685
+    const liq = computeLiqPriceCross(244.1, 1.4, 106.52, 'long');
+    expect(liq).toBeCloseTo(0.9685, 3);
+  });
+
+  it('LONG: a position that outgrew its budget liquidates NEARER the mark than the local estimate claims', () => {
+    const bot = { avg_entry_price: 1.3679, leverage: 2, direction: 'long' } as any;
+    const local = computeLiqPriceLocal(bot)!;
+    const cross = computeLiqPriceCross(244.1, 1.4, 106.52, 'long')!;
+    // This is the whole point of the function: the safeguard must see
+    // the higher (closer) number for a long, not the comfortable one.
+    expect(cross).toBeGreaterThan(local);
+    expect(Math.max(local, cross)).toBe(cross);
+  });
+
+  it("prefers GRVT's reported maintenance margin over the flat constant", () => {
+    const flat = computeLiqPriceCross(244.1, 1.4, 106.52, 'long')!;
+    // 2% of notional instead of 0.5% → liquidation moves closer to mark
+    const tiered = computeLiqPriceCross(244.1, 1.4, 106.52, 'long', 341.74 * 0.02)!;
+    expect(tiered).toBeGreaterThan(flat);
+  });
+
+  it('ignores a maintenance margin that is absurd (>= notional) and uses the constant', () => {
+    const flat = computeLiqPriceCross(244.1, 1.4, 106.52, 'long');
+    expect(computeLiqPriceCross(244.1, 1.4, 106.52, 'long', 99_999)).toBeCloseTo(flat!, 8);
+    expect(computeLiqPriceCross(244.1, 1.4, 106.52, 'long', 0)).toBeCloseTo(flat!, 8);
+  });
+
+  it('SHORT: liquidates above the mark', () => {
+    const liq = computeLiqPriceCross(244.1, 1.4, 106.52, 'short')!;
+    expect(liq).toBeGreaterThan(1.4);
+    // (341.74 + 106.52) / (244.1 * 1.005) = 1.8269
+    expect(liq).toBeCloseTo(1.8269, 3);
+  });
+
+  it('LONG: equity above notional is unreachable by price → null, never "safe"', () => {
+    expect(computeLiqPriceCross(10, 1.4, 500, 'long')).toBeNull();
+  });
+
+  it('returns null for missing position, mark or equity', () => {
+    expect(computeLiqPriceCross(0, 1.4, 106.52, 'long')).toBeNull();
+    expect(computeLiqPriceCross(244.1, 0, 106.52, 'long')).toBeNull();
+    expect(computeLiqPriceCross(244.1, 1.4, 0, 'long')).toBeNull();
+    expect(computeLiqPriceCross(NaN, 1.4, 106.52, 'long')).toBeNull();
+  });
+
+  it('treats an unsigned short size the same as a signed one', () => {
+    expect(computeLiqPriceCross(-244.1, 1.4, 106.52, 'short')).toBeCloseTo(
+      computeLiqPriceCross(244.1, 1.4, 106.52, 'short')!,
+      8
+    );
+  });
+});
 
 // ── 1. computeLiqPriceLocal ──────────────────────────────────────────
 

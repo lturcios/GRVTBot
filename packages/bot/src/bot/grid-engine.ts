@@ -344,6 +344,15 @@ const SAFEGUARD_MAINTENANCE_MARGIN = 0.005;
  * API call per tick. Returns null when there is no position yet —
  * the safeguard is a no-op in that case because there is nothing to
  * liquidate.
+ *
+ * BLIND SPOT: this assumes the position is sized exactly at bot.leverage
+ * against investment_usdt. It never reads position_size or account
+ * equity, so a position that grew past its budget (auto-shift accumulates
+ * without ever closing) reads as far safer than it is — and the error
+ * widens as the position grows, because the result only tracks
+ * avg_entry_price. Prefer computeLiqPriceCross() when account state is
+ * available; the safeguard keeps whichever of the two is more
+ * conservative.
  */
 export function computeLiqPriceLocal(bot: GridBot): number | null {
   if (!bot.avg_entry_price || bot.avg_entry_price <= 0) return null;
@@ -354,6 +363,61 @@ export function computeLiqPriceLocal(bot: GridBot): number | null {
   } else {
     return bot.avg_entry_price * (1 + factor);
   }
+}
+
+/**
+ * Cross-margin liquidation price derived from real account state instead
+ * of the bot's declared leverage.
+ *
+ * Liquidation is where account equity meets the maintenance requirement:
+ *
+ *   equity(P)      = equity + signedSize * (P - mark)
+ *   maintenance(P) = mmRate * |size| * P
+ *
+ * Solving equity(P) = maintenance(P) gives, with S = |size|:
+ *   long  → P = (S*mark - equity) / (S * (1 - mmRate))
+ *   short → P = (S*mark + equity) / (S * (1 + mmRate))
+ *
+ * `maintenanceMarginUsdt` is GRVT's own reported figure for the current
+ * position — it already accounts for per-instrument margin tiers, so it
+ * beats the flat SAFEGUARD_MAINTENANCE_MARGIN constant. We fall back to
+ * the constant when the field is missing or outside a sane range.
+ *
+ * Returns null when the inputs cannot describe a reachable liquidation
+ * (no position, no mark, or equity so large the price can never get
+ * there). Callers must treat null as "no opinion", never as "safe".
+ */
+export function computeLiqPriceCross(
+  positionSize: number,
+  markPrice: number,
+  equityUsdt: number,
+  direction: 'long' | 'short',
+  maintenanceMarginUsdt?: number
+): number | null {
+  const size = Math.abs(positionSize);
+  if (!Number.isFinite(size) || size <= 0) return null;
+  if (!Number.isFinite(markPrice) || markPrice <= 0) return null;
+  if (!Number.isFinite(equityUsdt) || equityUsdt <= 0) return null;
+
+  const notional = size * markPrice;
+  const reported = maintenanceMarginUsdt;
+  const mmRate =
+    reported != null && Number.isFinite(reported) && reported > 0 && reported < notional
+      ? reported / notional
+      : SAFEGUARD_MAINTENANCE_MARGIN;
+
+  const liq =
+    direction === 'long'
+      ? (notional - equityUsdt) / (size * (1 - mmRate))
+      : (notional + equityUsdt) / (size * (1 + mmRate));
+
+  if (!Number.isFinite(liq) || liq <= 0) return null;
+  // A long liquidates below the mark and a short above it. Anything else
+  // means the inputs disagree (stale mark, mismatched position) — say
+  // nothing rather than hand the safeguard a number it would trust.
+  if (direction === 'long' && liq >= markPrice) return null;
+  if (direction === 'short' && liq <= markPrice) return null;
+  return liq;
 }
 
 /**
@@ -2754,6 +2818,40 @@ export class GridBotInstance {
     }
   }
 
+  /** Cached GRVT account state for the C.4 safeguard. The monitor loop
+   * runs every ~5s but equity moves slowly enough that a 60s TTL keeps
+   * the extra call to roughly one per minute per bot. */
+  private liqAccountCache: { at: number; equity: number; maintenance: number } | null = null;
+
+  /**
+   * Read account equity + maintenance margin for the liquidation check.
+   * Returns null on any failure — the caller then falls back to the
+   * local estimate rather than skipping the safeguard.
+   */
+  private async readAccountStateForLiq(): Promise<{ equity: number; maintenance: number } | null> {
+    const TTL_MS = 60_000;
+    const now = Date.now();
+    if (this.liqAccountCache && now - this.liqAccountCache.at < TTL_MS) {
+      const { equity, maintenance } = this.liqAccountCache;
+      return { equity, maintenance };
+    }
+    try {
+      const balance = await this.grvt.getBalance();
+      const equity = parseFloat(balance.total_equity);
+      const maintenanceRaw = parseFloat(balance.maintenance_margin);
+      if (!Number.isFinite(equity) || equity <= 0) return null;
+      const maintenance = Number.isFinite(maintenanceRaw) ? maintenanceRaw : 0;
+      this.liqAccountCache = { at: now, equity, maintenance };
+      return { equity, maintenance };
+    } catch (error) {
+      log.warn(
+        { err: (error as Error).message },
+        `⚠️ Bot ${this.bot.id}: balance read failed, liquidation check falls back to the local estimate`
+      );
+      return null;
+    }
+  }
+
   /**
    * Monitorear órdenes y ejecutar lógica de round-trip
    * ⚠️ FIX CRÍTICO: Verificar fills reales con fill_history antes de asumir fills
@@ -2786,7 +2884,31 @@ export class GridBotInstance {
     // decide whether to pause or pause+close. No-op when the bot has no
     // position yet (avg_entry_price = 0) or the safeguard is disabled.
     if (this.bot.safeguard_enabled) {
-      const liq = computeLiqPriceLocal(this.bot);
+      // Two independent estimates. The local one is blind to position
+      // size, so a grid that outgrew its budget reads far safer than it
+      // is; the cross-margin one uses real equity but depends on a live
+      // balance read. Take whichever is CLOSER to the mark — a failed or
+      // garbage equity read can then never loosen the safeguard below
+      // the behavior it had before.
+      const liqLocal = computeLiqPriceLocal(this.bot);
+      const account = await this.readAccountStateForLiq();
+      const liqCross = account
+        ? computeLiqPriceCross(
+            this.bot.position_size,
+            currentPrice,
+            account.equity,
+            this.bot.direction,
+            account.maintenance
+          )
+        : null;
+      const estimates = [liqLocal, liqCross].filter(
+        (v): v is number => v !== null && Number.isFinite(v) && v > 0
+      );
+      const liq = estimates.length
+        ? this.bot.direction === 'long'
+          ? Math.max(...estimates)
+          : Math.min(...estimates)
+        : null;
       if (liq !== null && liq > 0) {
         const distancePct = this.bot.direction === 'long'
           ? ((currentPrice - liq) / currentPrice) * 100
