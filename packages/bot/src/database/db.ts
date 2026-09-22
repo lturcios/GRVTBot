@@ -150,6 +150,8 @@ export interface FundingRecord {
   position_size: number;
   funding_time: string;
   created_at: string;
+  /** GRVT settlement id. NULL on legacy synthetic rows. */
+  tx_id?: string | null;
 }
 
 export interface DailySnapshot {
@@ -829,17 +831,35 @@ export class GridBotDB {
       await this.dbRun(`ALTER TABLE grid_bots ADD COLUMN alert_funding_rate_pct REAL`);
     } catch { /* already exists */ }
 
-    // Funding bookkeeping. `last_funding_cumulative` is the watermark the
-    // funding delta is measured against (GRVT's meter is per position and
-    // restarts on close); `last_funding_alert_at` de-duplicates the
-    // high-funding alert across polls. Both stay NULL on legacy rows, which
-    // is the documented "never observed" state.
+    // `last_funding_alert_at` de-duplicates the high-funding alert across
+    // polls. `last_funding_cumulative` is a leftover from the delta/watermark
+    // model that funding_payment_history replaced; it is no longer read, and
+    // is kept only so a rollback to the previous build still finds its column.
     for (const col of [
       'last_funding_cumulative REAL',
       'last_funding_alert_at INTEGER',
     ]) {
       try { await this.dbRun(`ALTER TABLE grid_bots ADD COLUMN ${col}`); } catch { /* already exists */ }
     }
+
+    // funding_history.tx_id — GRVT's settlement id, so deduplication is the
+    // engine's job (INSERT OR IGNORE) rather than the caller's.
+    //
+    // The index is on (bot_id, tx_id), NOT on tx_id alone. GRVT scopes
+    // funding to sub_account + instrument and knows nothing about our bots,
+    // so several bots on the same pair (this deployment has three on
+    // XRP_USDT_Perp) legitimately see the SAME tx_id. A global unique index
+    // let whichever bot ran first claim every settlement and silently
+    // starved the rest — INSERT OR IGNORE reports that as "already stored".
+    //
+    // It stays PARTIAL so legacy rows, which carry a NULL tx_id, can coexist
+    // rather than collapsing into one.
+    try { await this.dbRun(`ALTER TABLE funding_history ADD COLUMN tx_id TEXT`); } catch { /* already exists */ }
+    await this.dbRun(`DROP INDEX IF EXISTS idx_funding_tx_id`);
+    await this.dbRun(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_funding_bot_tx_id
+        ON funding_history(bot_id, tx_id) WHERE tx_id IS NOT NULL
+    `);
 
     // Stamp version 1 (idempotent).
     await this.dbRun(`
@@ -1350,6 +1370,61 @@ export class GridBotDB {
         params.payment_usdt, params.position_size, params.funding_time]);
 
     return result.lastID!;
+  }
+
+  /**
+   * Insert one settled funding payment, keyed by GRVT's `tx_id`.
+   *
+   * Deduplication is the unique index's job: re-ingesting an overlapping
+   * window is a no-op, so pollers can simply re-read the last N payments
+   * without tracking a watermark. Returns true when a row was actually
+   * written.
+   */
+  async insertFundingPayment(params: {
+    bot_id: number;
+    instrument: string;
+    payment_usdt: number;
+    funding_time: string;
+    tx_id: string;
+  }): Promise<boolean> {
+    const result = await this.dbRun(`
+      INSERT OR IGNORE INTO funding_history
+        (bot_id, instrument, funding_rate, payment_usdt, position_size, funding_time, tx_id)
+      VALUES (?, ?, 0, ?, 0, ?, ?)
+    `, [params.bot_id, params.instrument, params.payment_usdt,
+        params.funding_time, params.tx_id]);
+
+    return (result.changes ?? 0) > 0;
+  }
+
+  /**
+   * Drop only this bot's SYNTHETIC funding rows — the ones the old delta
+   * model wrote, identifiable by a NULL tx_id. Rows carrying a tx_id are
+   * real settlements and are never touched.
+   *
+   * Scoping the delete this way is what makes the rebuild safe to interrupt:
+   * the caller inserts every real settlement FIRST (they cannot collide,
+   * since legacy rows have no tx_id) and calls this only once those writes
+   * have landed. A crash in between leaves the legacy rows in place and the
+   * next startup simply retries.
+   *
+   * Returns how many rows were removed.
+   */
+  async deleteLegacyFundingForBot(botId: number): Promise<number> {
+    const result = await this.dbRun(
+      `DELETE FROM funding_history WHERE bot_id = ? AND tx_id IS NULL`,
+      [botId]
+    );
+    return result.changes ?? 0;
+  }
+
+  /** How many fills this bot has archived. 0 ⇒ it never held a position. */
+  async countFillsForBot(botId: number): Promise<number> {
+    const row = await this.dbGet(
+      `SELECT COUNT(*) AS n FROM fills_archive WHERE bot_id = ?`,
+      [botId]
+    );
+    return Number(row?.n ?? 0);
   }
 
   /**

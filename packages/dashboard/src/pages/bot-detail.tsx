@@ -1515,7 +1515,10 @@ function useFundingColumns(): Column<FundingRow>[] {
     {
       key: 'rate',
       header: t('botDetail.tables.colRate'),
-      render: (r) => `${(r.funding_rate * 100).toFixed(4)}%`,
+      // GRVT's funding_payment_history carries no rate or position size, so
+      // these are 0 on every settlement ingested from it. Showing "0.0000%"
+      // would read as a real measured value; "—" says we don't know.
+      render: (r) => (r.funding_rate ? `${(r.funding_rate * 100).toFixed(4)}%` : '—'),
       sortValue: (r) => r.funding_rate,
       align: 'right',
       mono: true,
@@ -1523,7 +1526,7 @@ function useFundingColumns(): Column<FundingRow>[] {
     {
       key: 'pos',
       header: t('botDetail.tables.colPosition'),
-      render: (r) => formatSize(r.position_size),
+      render: (r) => (r.position_size ? formatSize(r.position_size) : '—'),
       sortValue: (r) => r.position_size,
       align: 'right',
       mono: true,

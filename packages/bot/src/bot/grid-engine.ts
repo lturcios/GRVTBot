@@ -1538,67 +1538,76 @@ export class GridEngine extends EventEmitter {
   }
 
   /**
-   * How much of the GRVT funding meter is NEW since we last looked.
+   * Ingest settled funding payments for one bot.
    *
-   * GRVT exposes only `cumulative_realized_funding_payment`, and it is a
-   * PER-POSITION meter: it restarts near 0 every time a position fully
-   * closes and a new one opens. Differencing it against the sum of stored
-   * rows (the previous approach) therefore wrote a large POSITIVE row on
-   * every position flip, erasing the closed position's real funding cost
-   * from `SUM(payment_usdt)`.
+   * Dedup is the unique index on `tx_id`, so re-reading an overlapping window
+   * is free and no watermark is needed. This replaced a delta model built on
+   * `cumulative_realized_funding_payment`, which had to reconstruct per-
+   * interval amounts from a running meter — and silently erased a closed
+   * position's cost whenever GRVT restarted that meter on a position flip.
    *
-   * `bot.last_funding_cumulative` is the watermark instead:
-   *   null → never observed. Seed from the stored rows so the one-time
-   *          repair of the legacy Math.abs()-corrupted rows still lands.
-   *   0    → the previous position closed; this is a fresh meter, so the
-   *          whole current reading is new.
-   *   else → the last reading of this same open position.
-   *
-   * KNOWN LIMITATION: a position that closes AND reopens entirely between
-   * two polls is never observed flat, so its reset is missed and one delta
-   * is misattributed. Narrowing that window means polling faster than the
-   * 30-minute cadence, which GRVT's rate limits do not justify for a
-   * number this small.
+   * Returns how many rows were newly written.
    */
-  private async computeFundingDelta(
-    bot: { id: number; last_funding_cumulative?: number | null },
-    currentCumulative: number
+  private async ingestFundingPayments(
+    bot: { id: number; pair: string; user_id?: number | null; grvt_sub_account_id?: number | null },
+    limit: number
   ): Promise<number> {
-    const watermark = bot.last_funding_cumulative;
+    const client = await this.getClientForBot(bot);
+    const payments = await client.getFundingPayments(bot.pair, limit);
 
-    if (watermark == null) {
-      const existingFunding = await db.getFundingHistoryByBot(bot.id);
-      const storedTotal = existingFunding.reduce((sum, r) => sum + r.payment_usdt, 0);
-      return currentCumulative - storedTotal;
+    let inserted = 0;
+    for (const p of payments) {
+      const written = await db.insertFundingPayment({
+        bot_id: bot.id,
+        instrument: p.instrument || bot.pair,
+        payment_usdt: p.amount_usdt,
+        funding_time: new Date(p.event_time_ms).toISOString(),
+        tx_id: p.tx_id,
+      });
+      if (written) inserted++;
     }
-
-    return currentCumulative - watermark;
-  }
-
-  /** Persist the funding watermark, keeping the in-memory bot in step. */
-  private async persistFundingWatermark(
-    bot: { id: number; last_funding_cumulative?: number | null },
-    cumulative: number
-  ): Promise<void> {
-    if (bot.last_funding_cumulative === cumulative) return;
-    await db.updateBot(bot.id, { last_funding_cumulative: cumulative });
-    bot.last_funding_cumulative = cumulative;
+    return inserted;
   }
 
   /**
-   * Park the watermark at 0 because the position is gone. Stored rows are
-   * left untouched — they record funding that genuinely happened.
+   * Emit the high-funding alert when the live rate crosses this bot's
+   * threshold. The payment history carries no rate, so the rate comes from
+   * the ticker; a lookup failure simply skips the check.
    */
-  private async resetFundingWatermark(
-    bot: { id: number; last_funding_cumulative?: number | null }
-  ): Promise<void> {
-    if (bot.last_funding_cumulative === 0) return;
-    await db.updateBot(bot.id, { last_funding_cumulative: 0 });
-    bot.last_funding_cumulative = 0;
+  private async checkFundingRateAlert(bot: GridBot): Promise<void> {
+    const threshold = bot.alert_funding_rate_pct;
+    if (threshold == null) return;
+
+    const lastAlert = bot.last_funding_alert_at ?? 0;
+    if (Date.now() - lastAlert < FUNDING_ALERT_COOLDOWN_MS) return;
+
+    let rate: number;
+    try {
+      const client = await this.getClientForBot(bot);
+      const ticker = await client.getTicker(bot.pair) as any;
+      // GRVT quotes this in PERCENT ("0.01" = 0.01% per 8h).
+      rate = parseFloat(String(ticker?.funding_rate_8h_curr ?? ticker?.funding_rate ?? '0')) / 100;
+    } catch (err) {
+      log.warn({ botId: bot.id, err: (err as Error).message }, 'funding rate lookup failed, alert skipped');
+      return;
+    }
+    if (!Number.isFinite(rate)) return;
+
+    if (Math.abs(rate) * 100 > threshold) {
+      await db.updateBot(bot.id, { last_funding_alert_at: Date.now() });
+      bot.last_funding_alert_at = Date.now();
+      this.emit('fundingRateAlert', {
+        botId: bot.id,
+        pair: bot.pair,
+        fundingRatePct: Math.round(rate * 100 * 10000) / 10000,
+        thresholdPct: threshold,
+      });
+    }
   }
 
   /**
-   * ⚠️ NUEVO: Polling periódico de funding history (cada 30 min)
+   * Periodic funding ingest (every 30 min). Re-reads the most recent
+   * payments; already-stored settlements are ignored by the tx_id index.
    */
   private async pollFundingHistory(): Promise<void> {
     try {
@@ -1617,67 +1626,20 @@ export class GridEngine extends EventEmitter {
       // user B's bot.
       for (const bot of activeBots) {
         try {
+          // Same attribution rule as the backfill: GRVT scopes funding to
+          // sub_account + instrument, so a bot that never traded must not
+          // inherit a same-pair sibling's settlements.
+          const fills = await db.countFillsForBot(bot.id);
+          if (fills === 0) continue;
+
           log.info(`💰 [DEBUG] Polling funding para bot ${bot.id} (${bot.pair})...`);
 
-          const client = await this.getClientForBot(bot);
-          const fundingPayments = await client.getFundingHistory(50, bot.pair);
-          log.info(`💰 [DEBUG] Bot ${bot.id}: ${fundingPayments.length} funding payments`);
+          // 50 payments ≈ 16 days at the 8-hour cadence — ample overlap so a
+          // restart or an outage cannot leave a permanent hole.
+          const inserted = await this.ingestFundingPayments(bot, 50);
+          log.info(`💰 [DEBUG] Bot ${bot.id}: ${inserted} pagos nuevos registrados`);
 
-          if (fundingPayments.length === 0) {
-            // No position for this instrument → GRVT's per-position funding
-            // meter is gone. Park the watermark at 0 so the NEXT position is
-            // measured from a fresh meter instead of being differenced
-            // against the closed position's total (which would write a
-            // positive row erasing that position's real funding cost).
-            await this.resetFundingWatermark(bot);
-            continue;
-          }
-
-          const payment = fundingPayments[0]!;
-          const currentCumulative = parseFloat(payment.payment); // already in USDT
-
-          const deltaUsdt = await this.computeFundingDelta(bot, currentCumulative);
-          // Compare on MAGNITUDE, not sign. A long paying funding makes the
-          // cumulative grow more negative every interval, so `delta < 1e-8`
-          // discarded every real payment and recorded only income.
-          if (Math.abs(deltaUsdt) < 1e-8) {
-            log.info(`💰 [DEBUG] Bot ${bot.id}: funding sin cambios (${currentCumulative.toFixed(6)} USDT acumulado)`);
-            await this.persistFundingWatermark(bot, currentCumulative);
-            continue;
-          }
-
-          const fundingRate = parseFloat(payment.funding_rate);
-          await db.createFundingRecord({
-            bot_id: bot.id,
-            instrument: bot.pair,
-            funding_rate: fundingRate,
-            payment_usdt: deltaUsdt,
-            position_size: parseFloat(payment.position_size),
-            funding_time: new Date(payment.funding_time * 1000).toISOString()
-          });
-
-          log.info(`💰 [DEBUG] Funding registrado para bot ${bot.id}: ${deltaUsdt.toFixed(6)} USDT (acumulado: ${currentCumulative.toFixed(6)})`);
-
-          await this.persistFundingWatermark(bot, currentCumulative);
-
-          // Emit alert if the absolute rate exceeds the per-bot threshold.
-          // Rate-limited: an elevated funding regime persists for hours and
-          // this poll runs every 30 minutes, so an undeduped emit would fire
-          // up to 48x/day for a single condition.
-          const threshold = bot.alert_funding_rate_pct;
-          if (threshold != null && Math.abs(fundingRate) * 100 > threshold) {
-            const lastAlert = bot.last_funding_alert_at ?? 0;
-            if (Date.now() - lastAlert >= FUNDING_ALERT_COOLDOWN_MS) {
-              await db.updateBot(bot.id, { last_funding_alert_at: Date.now() });
-              bot.last_funding_alert_at = Date.now();
-              this.emit('fundingRateAlert', {
-                botId: bot.id,
-                pair: bot.pair,
-                fundingRatePct: Math.round(fundingRate * 100 * 10000) / 10000,
-                thresholdPct: threshold,
-              });
-            }
-          }
+          await this.checkFundingRateAlert(bot);
 
           // Throttle between bots
           await new Promise(r => setTimeout(r, 1000));
@@ -1694,8 +1656,32 @@ export class GridEngine extends EventEmitter {
     }
   }
 
+  /** GRVT's hard cap for one funding_payment_history page. */
+  private static readonly FUNDING_PAGE_MAX = 500;
+
   /**
-   * ⚠️ NUEVO: Backfill inicial de funding history al startup
+   * Startup backfill of the funding history.
+   *
+   * GRVT serves every settlement since the sub-account's first position, so
+   * there is nothing to reconstruct and no watermark to resume from: fetch,
+   * insert, let the (bot_id, tx_id) index drop what is already stored.
+   *
+   * ONE-TIME REBUILD: rows written by the previous delta model carry a NULL
+   * tx_id. Their synthetic amounts would double-count against the real
+   * settlements, so they are removed — but only under three conditions, in
+   * this order:
+   *
+   *   1. The real settlements are INSERTED FIRST. They cannot collide with
+   *      legacy rows (those have no tx_id), so a crash or a failed write
+   *      mid-loop leaves the legacy rows untouched and the next startup
+   *      simply retries. Deleting first would have made an interrupted
+   *      rebuild unrecoverable: the purge marker is the NULL tx_id itself,
+   *      so once erased the branch never fires again.
+   *   2. Only NULL-tx_id rows are deleted, never real settlements.
+   *   3. Nothing is deleted when the response hit GRVT's page cap, because
+   *      a truncated page means history older than the page is NOT in hand
+   *      and "re-fetchable from GRVT" — the premise that makes this delete
+   *      safe — would no longer hold.
    */
   private async backfillFundingHistory(): Promise<void> {
     try {
@@ -1707,46 +1693,57 @@ export class GridEngine extends EventEmitter {
         return;
       }
 
-      // Multi-tenant: one backfill per bot, using the owner's client.
-      // Uses the same delta logic as pollFundingHistory: account_summary only
-      // returns the current cumulative, so we store the delta vs the stored total.
       for (const bot of allBots) {
         try {
+          // GRVT scopes funding to sub_account + instrument, so every bot on
+          // a pair sees the same settlements. A bot that never traded never
+          // held a position and therefore never accrued funding — give it
+          // nothing rather than a copy of a sibling's cost.
+          const fills = await db.countFillsForBot(bot.id);
+          if (fills === 0) {
+            log.info(`🔄 [DEBUG] Bot ${bot.id} (${bot.pair}): sin fills, no le corresponde funding`);
+            continue;
+          }
+
           log.info(`🔄 [DEBUG] Backfill funding para bot ${bot.id} (${bot.pair})...`);
 
           const client = await this.getClientForBot(bot);
-          const allFunding = await client.getFundingHistory(500, bot.pair);
-          log.info(`🔄 [DEBUG] Bot ${bot.id}: funding snapshot disponible: ${allFunding.length}`);
+          const payments = await client.getFundingPayments(bot.pair, GridEngine.FUNDING_PAGE_MAX);
+          log.info(`🔄 [DEBUG] Bot ${bot.id}: ${payments.length} pagos disponibles en GRVT`);
 
-          if (allFunding.length === 0) {
-            await this.resetFundingWatermark(bot);
-            continue;
+          if (payments.length === 0) continue;
+
+          let inserted = 0;
+          for (const p of payments) {
+            const written = await db.insertFundingPayment({
+              bot_id: bot.id,
+              instrument: p.instrument || bot.pair,
+              payment_usdt: p.amount_usdt,
+              funding_time: new Date(p.event_time_ms).toISOString(),
+              tx_id: p.tx_id,
+            });
+            if (written) inserted++;
           }
 
-          const payment = allFunding[0]!;
-          const currentCumulative = parseFloat(payment.payment); // already in USDT
-
-          // Watermark-based delta and magnitude comparison — see
-          // computeFundingDelta() and pollFundingHistory() for the rationale.
-          const deltaUsdt = await this.computeFundingDelta(bot, currentCumulative);
-          if (Math.abs(deltaUsdt) < 1e-8) {
-            log.info(`🔄 [DEBUG] Bot ${bot.id}: funding ya up-to-date (${currentCumulative.toFixed(6)} USDT acumulado)`);
-            await this.persistFundingWatermark(bot, currentCumulative);
-            continue;
+          // Every real settlement is stored now — only here is it safe to
+          // drop the synthetic rows.
+          const truncated = payments.length >= GridEngine.FUNDING_PAGE_MAX;
+          if (truncated) {
+            log.warn(
+              { botId: bot.id, fetched: payments.length },
+              'funding rebuild skipped: GRVT page cap hit, history may be incomplete'
+            );
+          } else {
+            const removed = await db.deleteLegacyFundingForBot(bot.id);
+            if (removed > 0) {
+              log.warn(
+                { botId: bot.id, removed, restored: payments.length },
+                'funding rebuild: dropped synthetic delta rows after restoring real settlements'
+              );
+            }
           }
 
-          await db.createFundingRecord({
-            bot_id: bot.id,
-            instrument: bot.pair,
-            funding_rate: parseFloat(payment.funding_rate),
-            payment_usdt: deltaUsdt,
-            position_size: parseFloat(payment.position_size),
-            funding_time: new Date(payment.funding_time * 1000).toISOString()
-          });
-
-          log.info(`🔄 [DEBUG] Backfill bot ${bot.id}: ${deltaUsdt.toFixed(6)} USDT registrado (acumulado: ${currentCumulative.toFixed(6)})`);
-
-          await this.persistFundingWatermark(bot, currentCumulative);
+          log.info(`🔄 [DEBUG] Backfill bot ${bot.id}: ${inserted} pagos registrados`);
 
           // Throttle between bots
           await new Promise(r => setTimeout(r, 2000));

@@ -113,6 +113,23 @@ export interface FundingPayment {
   funding_time: number;
 }
 
+/**
+ * One settled funding payment, as GRVT's funding_payment_history returns it.
+ *
+ * `amount_usdt` is already flipped into P&L polarity here: NEGATIVE is a cost,
+ * positive is a credit. GRVT's own `amount` counts the payment MADE (positive
+ * when you pay), which is the inverse — see getFundingPayments().
+ */
+export interface FundingPaymentRecord {
+  tx_id: string;
+  instrument: string;
+  currency: string;
+  /** Real settlement time in epoch ms (GRVT settles at 00:00/08:00/16:00 UTC). */
+  event_time_ms: number;
+  /** P&L polarity: negative = paid, positive = received. */
+  amount_usdt: number;
+}
+
 export interface Ticker {
   instrument: string;
   last_price: string;
@@ -637,6 +654,80 @@ export class GRVTClient {
    * Obtener historial de funding payments
    * ⚠️ FIX: GRVT usa POST para funding_history según specs
    */
+  /**
+   * Settled funding payments, one row per 8-hour interval.
+   *
+   * This is the real source. The earlier implementation derived funding from
+   * `account_summary`'s `cumulative_realized_funding_payment`, because an
+   * endpoint named `funding_history` 404s — but the endpoint is actually
+   * called `funding_payment_history`, and it works. Verified 2026-09-22:
+   * 336 rows reaching back to 2026-05-31, each carrying the settlement time,
+   * the signed amount and a `tx_id` that matches GRVT's own UI.
+   *
+   * Reading per-payment rows removes the need to reconstruct anything from a
+   * running meter: no deltas, no watermark, and no corruption when a position
+   * closes and GRVT restarts its per-position counter.
+   *
+   * POLARITY: GRVT's `amount` counts the payment MADE — positive when the
+   * account pays, negative when it receives (verified against tx 192056279,
+   * -0.015221, which GRVT's UI renders as +0.015221 green). We negate so the
+   * value stored and returned is P&L polarity, matching funding-math.ts.
+   */
+  async getFundingPayments(
+    instrument?: string,
+    limit: number = 100
+  ): Promise<FundingPaymentRecord[]> {
+    await rateLimiter.waitIfNeeded();
+
+    const body: Record<string, unknown> = {
+      sub_account_id: this.tradingAccountId,
+      limit: Math.min(limit, 500),
+    };
+    if (instrument) body.instrument = instrument;
+
+    const data = await this.authedRequest(`${TRADING_URL}/funding_payment_history`, body);
+    const rows = Array.isArray(data) ? data : [];
+
+    const out: FundingPaymentRecord[] = [];
+    for (const row of rows) {
+      const txId = String(row?.tx_id ?? '');
+      if (!txId) continue;
+      // GRVT filters server-side when `instrument` is supplied, but it has
+      // historically ignored unknown request fields — re-filter so a silent
+      // change can never attribute ETH funding to an XRP bot.
+      if (instrument && row?.instrument !== instrument) continue;
+
+      const rawAmount = parseFloat(String(row?.amount ?? '0'));
+      if (!Number.isFinite(rawAmount)) continue;
+
+      // Nanosecond epoch string → ms. A malformed or missing timestamp is
+      // SKIPPED, not coerced: falling back to 0 would store the settlement
+      // at 1970-01-01 and silently corrupt every ORDER BY funding_time.
+      const nanos = String(row?.event_time ?? '');
+      if (!/^\d+$/.test(nanos)) {
+        console.log(`📡 [DEBUG] funding ${txId}: event_time invalido ("${nanos}"), fila descartada`);
+        continue;
+      }
+      const eventMs = Number(BigInt(nanos) / 1000000n);
+      if (!Number.isFinite(eventMs) || eventMs <= 0) {
+        console.log(`📡 [DEBUG] funding ${txId}: event_time fuera de rango, fila descartada`);
+        continue;
+      }
+
+      out.push({
+        tx_id: txId,
+        instrument: String(row?.instrument ?? instrument ?? ''),
+        currency: String(row?.currency ?? 'USDT'),
+        event_time_ms: eventMs,
+        amount_usdt: -rawAmount,
+      });
+    }
+
+    console.log(`📡 [DEBUG] funding_payment_history ${instrument ?? 'all'}: ${out.length} pagos`);
+    return out;
+  }
+
+  /** @deprecated Cumulative meter. Use getFundingPayments() — see its docblock. */
   async getFundingHistory(limit: number = 100, instrument?: string): Promise<FundingPayment[]> {
     await rateLimiter.waitIfNeeded();
     

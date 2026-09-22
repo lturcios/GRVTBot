@@ -101,6 +101,92 @@ describe('GridBotDB migrations (D.6)', () => {
     expect(cols).toContain('instrument');
   });
 
+  it('creates funding_history with tx_id and dedupes on it', async () => {
+    const db = await makeDb();
+    expect(await columns(db, 'funding_history')).toContain('tx_id');
+
+    const p = priv(db);
+    await p.dbRun(`INSERT INTO grid_bots
+      (id, pair, direction, leverage, lower_price, upper_price, num_grids, investment_usdt)
+      VALUES (5, 'XRP_USDT_Perp', 'long', 2, 0.9, 1.2, 15, 92)`);
+
+    const row = {
+      bot_id: 5, instrument: 'XRP_USDT_Perp',
+      payment_usdt: -0.028144, funding_time: '2026-09-22T00:00:00.000Z',
+      tx_id: '195951743',
+    };
+    expect(await db.insertFundingPayment(row)).toBe(true);
+    // Same settlement seen again on an overlapping poll → no second row.
+    expect(await db.insertFundingPayment(row)).toBe(false);
+
+    const all = await db.getFundingHistoryByBot(5);
+    expect(all).toHaveLength(1);
+    expect(all[0]!.payment_usdt).toBeCloseTo(-0.028144, 8);
+
+    // Legacy rows carry a NULL tx_id; the partial index must let several
+    // of them coexist rather than collapsing them into one.
+    for (let i = 0; i < 3; i++) {
+      await db.createFundingRecord({
+        bot_id: 5, instrument: 'XRP_USDT_Perp', funding_rate: 0,
+        payment_usdt: 0.03, position_size: 0,
+        funding_time: '2026-09-01T00:00:00.000Z',
+      });
+    }
+    expect(await db.getFundingHistoryByBot(5)).toHaveLength(4);
+  });
+
+  it('lets two bots on the same pair each store the SAME settlement', async () => {
+    // GRVT scopes funding to sub_account + instrument and knows nothing about
+    // our bots, so bots sharing a pair legitimately see the same tx_id. With
+    // the index on tx_id ALONE, whichever bot ran first claimed every
+    // settlement and INSERT OR IGNORE silently starved the others.
+    const db = await makeDb();
+    const p = priv(db);
+    for (const id of [3, 5]) {
+      await p.dbRun(`INSERT INTO grid_bots
+        (id, pair, direction, leverage, lower_price, upper_price, num_grids, investment_usdt)
+        VALUES (?, 'XRP_USDT_Perp', 'long', 2, 0.9, 1.2, 15, 92)`, id);
+    }
+
+    const settlement = {
+      instrument: 'XRP_USDT_Perp', payment_usdt: -0.028144,
+      funding_time: '2026-09-22T00:00:00.000Z', tx_id: '195951743',
+    };
+    expect(await db.insertFundingPayment({ ...settlement, bot_id: 3 })).toBe(true);
+    expect(await db.insertFundingPayment({ ...settlement, bot_id: 5 })).toBe(true);
+
+    expect(await db.getFundingHistoryByBot(3)).toHaveLength(1);
+    expect(await db.getFundingHistoryByBot(5)).toHaveLength(1);
+
+    // Still idempotent within a bot.
+    expect(await db.insertFundingPayment({ ...settlement, bot_id: 5 })).toBe(false);
+    expect(await db.getFundingHistoryByBot(5)).toHaveLength(1);
+  });
+
+  it('deleteLegacyFundingForBot removes only NULL-tx_id rows', async () => {
+    const db = await makeDb();
+    const p = priv(db);
+    await p.dbRun(`INSERT INTO grid_bots
+      (id, pair, direction, leverage, lower_price, upper_price, num_grids, investment_usdt)
+      VALUES (5, 'XRP_USDT_Perp', 'long', 2, 0.9, 1.2, 15, 92)`);
+
+    await db.insertFundingPayment({
+      bot_id: 5, instrument: 'XRP_USDT_Perp', payment_usdt: -0.028144,
+      funding_time: '2026-09-22T00:00:00.000Z', tx_id: '195951743',
+    });
+    await db.createFundingRecord({
+      bot_id: 5, instrument: 'XRP_USDT_Perp', funding_rate: 0,
+      payment_usdt: 0.03, position_size: 0,
+      funding_time: '2026-09-01T00:00:00.000Z',
+    });
+
+    expect(await db.deleteLegacyFundingForBot(5)).toBe(1);
+
+    const left = await db.getFundingHistoryByBot(5);
+    expect(left).toHaveLength(1);
+    expect(left[0]!.tx_id).toBe('195951743');
+  });
+
   it('creates paired_roundtrips with bot_id (unification fix)', async () => {
     const db = await makeDb();
     const cols = await columns(db, 'paired_roundtrips');

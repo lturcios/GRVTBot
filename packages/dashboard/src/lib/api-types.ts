@@ -256,11 +256,22 @@ export interface OrderRow {
 export interface FundingRow {
   id: number;
   instrument: string;
+  /**
+   * @deprecated Always 0 on settlements ingested from GRVT's
+   * funding_payment_history, which carries no rate. Render "—" when falsy.
+   */
   funding_rate: number;
+  /** Signed: negative is a cost, positive is a credit. */
   payment_usdt: number;
+  /**
+   * @deprecated Always 0 on settlements ingested from GRVT's
+   * funding_payment_history, which carries no position size.
+   */
   position_size: number;
   funding_time: string;
   created_at: string;
+  /** GRVT settlement id. Absent on legacy synthetic rows. */
+  tx_id?: string | null;
 }
 
 export interface ValidateBotInput {
