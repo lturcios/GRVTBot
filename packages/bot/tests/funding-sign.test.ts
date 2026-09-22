@@ -224,11 +224,15 @@ describe('GRVTClient.getFundingHistory — sign preservation', () => {
     return client;
   }
 
-  it('keeps the NEGATIVE cumulative intact (Math.abs regression)', async () => {
+  // GRVT's meter counts the PAYMENT MADE: it rises as the account pays.
+  // Production reading on 2026-09-22 was +2.369793 while the XRP funding
+  // rate was +0.01% (positive ⇒ longs pay) and this bot is long. We store
+  // P&L polarity, so the client negates.
+  it('stores a GRVT payment counter as a NEGATIVE cost', async () => {
     const client = await clientWith([
       {
         instrument: 'XRP_USDT_Perp',
-        cumulative_realized_funding_payment: '-2.34',
+        cumulative_realized_funding_payment: '2.369793',
         size: '183.2',
       },
     ]);
@@ -236,14 +240,14 @@ describe('GRVTClient.getFundingHistory — sign preservation', () => {
     const out = await client.getFundingHistory(50, 'XRP_USDT_Perp');
 
     expect(out).toHaveLength(1);
-    expect(parseFloat(out[0].payment)).toBeCloseTo(-2.34, 8);
+    expect(parseFloat(out[0].payment)).toBeCloseTo(-2.369793, 8);
   });
 
-  it('keeps a positive cumulative positive', async () => {
+  it('stores a negative GRVT counter (funding received) as income', async () => {
     const client = await clientWith([
       {
         instrument: 'XRP_USDT_Perp',
-        cumulative_realized_funding_payment: '0.91',
+        cumulative_realized_funding_payment: '-0.91',
         size: '183.2',
       },
     ]);
@@ -252,24 +256,44 @@ describe('GRVTClient.getFundingHistory — sign preservation', () => {
     expect(parseFloat(out[0].payment)).toBeCloseTo(0.91, 8);
   });
 
-  it('carries the live funding rate instead of a hardcoded zero', async () => {
-    const client = await clientWith([
-      {
-        instrument: 'XRP_USDT_Perp',
-        cumulative_realized_funding_payment: '-2.34',
-        size: '183.2',
-      },
-    ]);
+  it('normalises the ticker rate from percent to a fraction', async () => {
+    // GRVT quotes "0.01" meaning 0.01% per 8h, not 1%.
+    const client = await clientWith(
+      [
+        {
+          instrument: 'XRP_USDT_Perp',
+          cumulative_realized_funding_payment: '2.369793',
+          size: '183.2',
+        },
+      ],
+      { funding_rate_8h_curr: '0.01', funding_rate: '0.01' }
+    );
 
     const out = await client.getFundingHistory(50, 'XRP_USDT_Perp');
-    expect(parseFloat(out[0].funding_rate)).toBeCloseTo(0.00012, 8);
+    expect(parseFloat(out[0].funding_rate)).toBeCloseTo(0.0001, 10);
+  });
+
+  it('falls back to funding_rate when funding_rate_8h_curr is absent', async () => {
+    const client = await clientWith(
+      [
+        {
+          instrument: 'XRP_USDT_Perp',
+          cumulative_realized_funding_payment: '2.369793',
+          size: '183.2',
+        },
+      ],
+      { funding_rate: '0.02' }
+    );
+
+    const out = await client.getFundingHistory(50, 'XRP_USDT_Perp');
+    expect(parseFloat(out[0].funding_rate)).toBeCloseTo(0.0002, 10);
   });
 
   it('still returns funding when the ticker lookup fails', async () => {
     const client = await clientWith([
       {
         instrument: 'XRP_USDT_Perp',
-        cumulative_realized_funding_payment: '-2.34',
+        cumulative_realized_funding_payment: '2.369793',
         size: '183.2',
       },
     ]);
@@ -278,7 +302,7 @@ describe('GRVTClient.getFundingHistory — sign preservation', () => {
     const out = await client.getFundingHistory(50, 'XRP_USDT_Perp');
 
     expect(out).toHaveLength(1);
-    expect(parseFloat(out[0].payment)).toBeCloseTo(-2.34, 8);
+    expect(parseFloat(out[0].payment)).toBeCloseTo(-2.369793, 8);
     expect(out[0].funding_rate).toBe('0');
   });
 
@@ -286,12 +310,12 @@ describe('GRVTClient.getFundingHistory — sign preservation', () => {
     const client = await clientWith([
       {
         instrument: 'ETH_USDT_Perp',
-        cumulative_realized_funding_payment: '-9.99',
+        cumulative_realized_funding_payment: '9.99',
         size: '0.2',
       },
       {
         instrument: 'XRP_USDT_Perp',
-        cumulative_realized_funding_payment: '-2.34',
+        cumulative_realized_funding_payment: '2.369793',
         size: '183.2',
       },
     ]);
@@ -300,6 +324,32 @@ describe('GRVTClient.getFundingHistory — sign preservation', () => {
 
     expect(out).toHaveLength(1);
     expect(out[0].instrument).toBe('XRP_USDT_Perp');
+  });
+});
+
+describe('the in-flight production repair', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockDb.createFundingRecord.mockResolvedValue(1);
+  });
+
+  it('flips the stored history to P&L polarity in one correcting row', async () => {
+    // Live state on 2026-09-22: 124 legacy rows summing to +2.369793 under
+    // GRVT's payment polarity, watermark persisted at the same value.
+    mockDb.getBotsByStatus.mockResolvedValue([
+      { ...BOT, last_funding_cumulative: 2.369793 },
+    ]);
+    // Client now negates, so the engine sees the cost polarity.
+    const { engine } = engineWith(snapshot('-2.369793'));
+
+    await (engine as any).pollFundingHistory();
+
+    const row = mockDb.createFundingRecord.mock.calls[0]![0];
+    expect(row.payment_usdt).toBeCloseTo(-4.739586, 8);
+    // Stored sum lands on the true cost, in P&L polarity.
+    expect(2.369793 + row.payment_usdt).toBeCloseTo(-2.369793, 8);
+    expect(fundingPaidUsdt(storedRows(2.369793, row.payment_usdt)))
+      .toBeCloseTo(2.369793, 8);
   });
 });
 

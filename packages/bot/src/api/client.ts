@@ -672,9 +672,15 @@ export class GRVTClient {
           // per-bot backfill loop can burst this straight into a rate limit.
           await rateLimiter.waitIfNeeded();
           const ticker = await this.getTicker(instrument) as any;
-          liveFundingRate = String(
-            ticker?.funding_rate_8h_curr ?? ticker?.funding_rate ?? '0'
+          // GRVT quotes the ticker rate in PERCENT ("0.01" = 0.01% per 8h —
+          // verified against XRP_USDT_Perp, whose 0.031357 USDT charge on a
+          // 218-unit position works out to 0.0096%/8h). Consumers downstream
+          // multiply by 100 to display a percentage, so normalise to a
+          // FRACTION here or the alert threshold is off by 100x.
+          const rawRate = parseFloat(
+            String(ticker?.funding_rate_8h_curr ?? ticker?.funding_rate ?? '0')
           );
+          liveFundingRate = String(Number.isFinite(rawRate) ? rawRate / 100 : 0);
         } catch (tickerErr) {
           console.log(`📡 [DEBUG] Funding rate no disponible para ${instrument}: ${(tickerErr as Error).message}`);
         }
@@ -699,11 +705,21 @@ export class GRVTClient {
                 // 739 rows in production were corrupted by this; backfilled
                 // via SQL on deploy. New rows now correctly stamp seconds.
                 funding_time: Math.floor(Date.now() / 1000),
-                // Sign is SIGNIFICANT: GRVT returns a negative cumulative when
-                // the account PAYS funding (long in a positive-funding market)
-                // and positive when it RECEIVES. The previous Math.abs() turned
-                // every cost into income. Consumers must keep the sign intact.
-                payment: fundingAmount.toString(),
+                // POLARITY FLIP — read this before touching the sign.
+                //
+                // GRVT's `cumulative_realized_funding_payment` counts the
+                // PAYMENT MADE: it goes UP (positive) as the account pays.
+                // Verified in production on 2026-09-22 — the meter read
+                // +2.369793 while XRP_USDT_Perp funding_rate was +0.01%
+                // (positive rate ⇒ longs pay shorts) and this bot is long.
+                // GRVT's own UI shows the same quantity as -2.34 because it
+                // renders P&L impact, not the payment counter.
+                //
+                // We store P&L polarity (negative = cost) so that both the
+                // raw SUM surfaced by /api/v2 and fundingPaidUsdt() in
+                // funding-math.ts are correct without per-caller fixups.
+                // Hence the negation.
+                payment: (-fundingAmount).toString(),
                 position_size: position.size || '0'
               });
               
