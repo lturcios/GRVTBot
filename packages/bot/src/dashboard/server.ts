@@ -17,6 +17,7 @@ import { db } from '../database/db.js';
 import { gridEngine } from '../bot/grid-engine.js';
 import { getAuthStatus, authenticatedRequest } from '../api/auth.js';
 import { mountV2 } from '../server/v2-bootstrap.js';
+import { fundingPaidUsdt } from '../bot/funding-math.js';
 
 dotenv.config();
 
@@ -1209,7 +1210,10 @@ async function calculateRealPnL(botId: number): Promise<{
 
     // 2. Calcular funding totales 
     const fundingHistory = await db.getFundingHistoryByBot(botId);
-    const totalFunding = fundingHistory.reduce((sum, funding) => sum + Math.abs(funding.payment_usdt), 0);
+    // Cost polarity (positive = paid), because it is subtracted from the
+    // gross trend PnL below. See funding-math.ts for the sign conventions —
+    // the previous Math.abs() here reported every credit as a cost.
+    const totalFunding = fundingPaidUsdt(fundingHistory);
     console.log(`💰 [DEBUG] Bot ${botId} funding total: ${totalFunding}`);
 
     // 3. Get ALL PnL data directly from GRVT account_summary (source of truth)

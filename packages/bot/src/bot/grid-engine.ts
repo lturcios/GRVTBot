@@ -167,6 +167,10 @@ const MAX_AUTO_BUY_USDT = 200;
 const MIN_LOWER_DISTANCE_PCT = 0.5;
 const MAX_UPPER_DISTANCE_PCT = 2.0;
 const AUTO_BUY_SLIPPAGE_PCT = 0.5;
+// Minimum gap between two fundingRateAlert emits for the same bot. Funding
+// regimes persist for hours while the poll runs every 30 minutes, so without
+// this a single elevated regime would alert up to 48 times a day.
+const FUNDING_ALERT_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 
 export function computeRangeUpdatePlan(input: RangeUpdateInputs): RangeUpdatePlan {
   const { bot, newLower, newUpper, currentPrice, currentPosition, existingLevels, positionReadError } = input;
@@ -1534,6 +1538,66 @@ export class GridEngine extends EventEmitter {
   }
 
   /**
+   * How much of the GRVT funding meter is NEW since we last looked.
+   *
+   * GRVT exposes only `cumulative_realized_funding_payment`, and it is a
+   * PER-POSITION meter: it restarts near 0 every time a position fully
+   * closes and a new one opens. Differencing it against the sum of stored
+   * rows (the previous approach) therefore wrote a large POSITIVE row on
+   * every position flip, erasing the closed position's real funding cost
+   * from `SUM(payment_usdt)`.
+   *
+   * `bot.last_funding_cumulative` is the watermark instead:
+   *   null → never observed. Seed from the stored rows so the one-time
+   *          repair of the legacy Math.abs()-corrupted rows still lands.
+   *   0    → the previous position closed; this is a fresh meter, so the
+   *          whole current reading is new.
+   *   else → the last reading of this same open position.
+   *
+   * KNOWN LIMITATION: a position that closes AND reopens entirely between
+   * two polls is never observed flat, so its reset is missed and one delta
+   * is misattributed. Narrowing that window means polling faster than the
+   * 30-minute cadence, which GRVT's rate limits do not justify for a
+   * number this small.
+   */
+  private async computeFundingDelta(
+    bot: { id: number; last_funding_cumulative?: number | null },
+    currentCumulative: number
+  ): Promise<number> {
+    const watermark = bot.last_funding_cumulative;
+
+    if (watermark == null) {
+      const existingFunding = await db.getFundingHistoryByBot(bot.id);
+      const storedTotal = existingFunding.reduce((sum, r) => sum + r.payment_usdt, 0);
+      return currentCumulative - storedTotal;
+    }
+
+    return currentCumulative - watermark;
+  }
+
+  /** Persist the funding watermark, keeping the in-memory bot in step. */
+  private async persistFundingWatermark(
+    bot: { id: number; last_funding_cumulative?: number | null },
+    cumulative: number
+  ): Promise<void> {
+    if (bot.last_funding_cumulative === cumulative) return;
+    await db.updateBot(bot.id, { last_funding_cumulative: cumulative });
+    bot.last_funding_cumulative = cumulative;
+  }
+
+  /**
+   * Park the watermark at 0 because the position is gone. Stored rows are
+   * left untouched — they record funding that genuinely happened.
+   */
+  private async resetFundingWatermark(
+    bot: { id: number; last_funding_cumulative?: number | null }
+  ): Promise<void> {
+    if (bot.last_funding_cumulative === 0) return;
+    await db.updateBot(bot.id, { last_funding_cumulative: 0 });
+    bot.last_funding_cumulative = 0;
+  }
+
+  /**
    * ⚠️ NUEVO: Polling periódico de funding history (cada 30 min)
    */
   private async pollFundingHistory(): Promise<void> {
@@ -1559,21 +1623,26 @@ export class GridEngine extends EventEmitter {
           const fundingPayments = await client.getFundingHistory(50, bot.pair);
           log.info(`💰 [DEBUG] Bot ${bot.id}: ${fundingPayments.length} funding payments`);
 
-          if (fundingPayments.length === 0) continue;
+          if (fundingPayments.length === 0) {
+            // No position for this instrument → GRVT's per-position funding
+            // meter is gone. Park the watermark at 0 so the NEXT position is
+            // measured from a fresh meter instead of being differenced
+            // against the closed position's total (which would write a
+            // positive row erasing that position's real funding cost).
+            await this.resetFundingWatermark(bot);
+            continue;
+          }
 
-          // account_summary returns a single cumulative snapshot (not per-interval events).
-          // We compute the delta vs the sum of stored records so that SUM(payment_usdt)
-          // always equals the running cumulative total, and no duplicate rows are created
-          // when the cumulative hasn't changed.
           const payment = fundingPayments[0]!;
           const currentCumulative = parseFloat(payment.payment); // already in USDT
 
-          const existingFunding = await db.getFundingHistoryByBot(bot.id);
-          const storedTotal = existingFunding.reduce((sum, r) => sum + r.payment_usdt, 0);
-
-          const deltaUsdt = currentCumulative - storedTotal;
-          if (deltaUsdt < 1e-8) {
+          const deltaUsdt = await this.computeFundingDelta(bot, currentCumulative);
+          // Compare on MAGNITUDE, not sign. A long paying funding makes the
+          // cumulative grow more negative every interval, so `delta < 1e-8`
+          // discarded every real payment and recorded only income.
+          if (Math.abs(deltaUsdt) < 1e-8) {
             log.info(`💰 [DEBUG] Bot ${bot.id}: funding sin cambios (${currentCumulative.toFixed(6)} USDT acumulado)`);
+            await this.persistFundingWatermark(bot, currentCumulative);
             continue;
           }
 
@@ -1589,15 +1658,25 @@ export class GridEngine extends EventEmitter {
 
           log.info(`💰 [DEBUG] Funding registrado para bot ${bot.id}: ${deltaUsdt.toFixed(6)} USDT (acumulado: ${currentCumulative.toFixed(6)})`);
 
+          await this.persistFundingWatermark(bot, currentCumulative);
+
           // Emit alert if the absolute rate exceeds the per-bot threshold.
+          // Rate-limited: an elevated funding regime persists for hours and
+          // this poll runs every 30 minutes, so an undeduped emit would fire
+          // up to 48x/day for a single condition.
           const threshold = bot.alert_funding_rate_pct;
           if (threshold != null && Math.abs(fundingRate) * 100 > threshold) {
-            this.emit('fundingRateAlert', {
-              botId: bot.id,
-              pair: bot.pair,
-              fundingRatePct: Math.round(fundingRate * 100 * 10000) / 10000,
-              thresholdPct: threshold,
-            });
+            const lastAlert = bot.last_funding_alert_at ?? 0;
+            if (Date.now() - lastAlert >= FUNDING_ALERT_COOLDOWN_MS) {
+              await db.updateBot(bot.id, { last_funding_alert_at: Date.now() });
+              bot.last_funding_alert_at = Date.now();
+              this.emit('fundingRateAlert', {
+                botId: bot.id,
+                pair: bot.pair,
+                fundingRatePct: Math.round(fundingRate * 100 * 10000) / 10000,
+                thresholdPct: threshold,
+              });
+            }
           }
 
           // Throttle between bots
@@ -1639,17 +1718,20 @@ export class GridEngine extends EventEmitter {
           const allFunding = await client.getFundingHistory(500, bot.pair);
           log.info(`🔄 [DEBUG] Bot ${bot.id}: funding snapshot disponible: ${allFunding.length}`);
 
-          if (allFunding.length === 0) continue;
+          if (allFunding.length === 0) {
+            await this.resetFundingWatermark(bot);
+            continue;
+          }
 
           const payment = allFunding[0]!;
           const currentCumulative = parseFloat(payment.payment); // already in USDT
 
-          const existingFunding = await db.getFundingHistoryByBot(bot.id);
-          const storedTotal = existingFunding.reduce((sum, r) => sum + r.payment_usdt, 0);
-
-          const deltaUsdt = currentCumulative - storedTotal;
-          if (deltaUsdt < 1e-8) {
+          // Watermark-based delta and magnitude comparison — see
+          // computeFundingDelta() and pollFundingHistory() for the rationale.
+          const deltaUsdt = await this.computeFundingDelta(bot, currentCumulative);
+          if (Math.abs(deltaUsdt) < 1e-8) {
             log.info(`🔄 [DEBUG] Bot ${bot.id}: funding ya up-to-date (${currentCumulative.toFixed(6)} USDT acumulado)`);
+            await this.persistFundingWatermark(bot, currentCumulative);
             continue;
           }
 
@@ -1663,6 +1745,8 @@ export class GridEngine extends EventEmitter {
           });
 
           log.info(`🔄 [DEBUG] Backfill bot ${bot.id}: ${deltaUsdt.toFixed(6)} USDT registrado (acumulado: ${currentCumulative.toFixed(6)})`);
+
+          await this.persistFundingWatermark(bot, currentCumulative);
 
           // Throttle between bots
           await new Promise(r => setTimeout(r, 2000));

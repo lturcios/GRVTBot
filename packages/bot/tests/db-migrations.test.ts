@@ -69,6 +69,9 @@ describe('GridBotDB migrations (D.6)', () => {
       'sl_pct', 'tp_pct',
       'auto_shift_enabled', 'auto_shift_pct', 'last_auto_shift_at',
       'virtual_enabled', 'active_window_size',
+      'alert_funding_rate_pct',
+      // Funding bookkeeping: delta watermark + alert cooldown stamp.
+      'last_funding_cumulative', 'last_funding_alert_at',
     ]) {
       expect(cols, `missing migration column: ${c}`).toContain(c);
     }

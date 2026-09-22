@@ -659,7 +659,27 @@ export class GRVTClient {
       });
       
       const fundingPayments: FundingPayment[] = [];
-      
+
+      // The account_summary payload carries no funding RATE, only the
+      // cumulative payment. Fetch the live rate from the ticker so the
+      // per-bot `alert_funding_rate_pct` threshold has a real number to
+      // compare against — with the hardcoded '0' it could never fire.
+      // Best-effort: a ticker failure must never block funding recording.
+      let liveFundingRate = '0';
+      if (instrument) {
+        try {
+          // Same throttle every other outbound call honours — without it the
+          // per-bot backfill loop can burst this straight into a rate limit.
+          await rateLimiter.waitIfNeeded();
+          const ticker = await this.getTicker(instrument) as any;
+          liveFundingRate = String(
+            ticker?.funding_rate_8h_curr ?? ticker?.funding_rate ?? '0'
+          );
+        } catch (tickerErr) {
+          console.log(`📡 [DEBUG] Funding rate no disponible para ${instrument}: ${(tickerErr as Error).message}`);
+        }
+      }
+
       // Extraer funding de cada posición
       if (data.positions && Array.isArray(data.positions)) {
         for (const position of data.positions) {
@@ -671,7 +691,7 @@ export class GRVTClient {
               fundingPayments.push({
                 sub_account_id: this.tradingAccountId,
                 instrument: position.instrument,
-                funding_rate: '0', // No disponible en summary
+                funding_rate: liveFundingRate,
                 // BUG FIX: grid-engine.ts treats funding_time as SECONDS and
                 // does `payment.funding_time * 1000` to convert to ms before
                 // building a Date. Date.now() returns ms, so the *1000 was
@@ -679,7 +699,11 @@ export class GRVTClient {
                 // 739 rows in production were corrupted by this; backfilled
                 // via SQL on deploy. New rows now correctly stamp seconds.
                 funding_time: Math.floor(Date.now() / 1000),
-                payment: Math.abs(fundingAmount).toString(), // Valor absoluto
+                // Sign is SIGNIFICANT: GRVT returns a negative cumulative when
+                // the account PAYS funding (long in a positive-funding market)
+                // and positive when it RECEIVES. The previous Math.abs() turned
+                // every cost into income. Consumers must keep the sign intact.
+                payment: fundingAmount.toString(),
                 position_size: position.size || '0'
               });
               

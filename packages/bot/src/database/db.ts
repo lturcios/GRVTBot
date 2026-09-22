@@ -79,6 +79,17 @@ export interface GridBot {
   grvt_sub_account_id?: number | null;
   // Phase 3.4: funding rate alert threshold (null = disabled)
   alert_funding_rate_pct?: number | null;
+  // Last raw `cumulative_realized_funding_payment` observed from GRVT for
+  // this bot's CURRENT position. GRVT's meter is per POSITION, not per
+  // account, so it restarts at ~0 whenever a position fully closes. This
+  // watermark is what funding deltas are measured against:
+  //   null → never observed (seed from the stored rows, one-time repair)
+  //   0    → position closed; the next reading starts a fresh meter
+  //   <0/>0→ the last reading of the currently open position
+  last_funding_cumulative?: number | null;
+  // Unix ms of the last fundingRateAlert emitted, so a persistently
+  // elevated funding regime does not re-alert every 30-minute poll.
+  last_funding_alert_at?: number | null;
 }
 
 export interface GridLevel {
@@ -818,6 +829,18 @@ export class GridBotDB {
       await this.dbRun(`ALTER TABLE grid_bots ADD COLUMN alert_funding_rate_pct REAL`);
     } catch { /* already exists */ }
 
+    // Funding bookkeeping. `last_funding_cumulative` is the watermark the
+    // funding delta is measured against (GRVT's meter is per position and
+    // restarts on close); `last_funding_alert_at` de-duplicates the
+    // high-funding alert across polls. Both stay NULL on legacy rows, which
+    // is the documented "never observed" state.
+    for (const col of [
+      'last_funding_cumulative REAL',
+      'last_funding_alert_at INTEGER',
+    ]) {
+      try { await this.dbRun(`ALTER TABLE grid_bots ADD COLUMN ${col}`); } catch { /* already exists */ }
+    }
+
     // Stamp version 1 (idempotent).
     await this.dbRun(`
       INSERT OR IGNORE INTO schema_version (version, applied_at)
@@ -991,6 +1014,7 @@ export class GridBotDB {
       'auto_shift_enabled', 'auto_shift_pct', 'last_auto_shift_at', 'bot_type',
       'dca_amount_usdt', 'dca_interval_hours', 'last_dca_at', 'virtual_enabled',
       'active_window_size', 'grvt_sub_account_id', 'alert_funding_rate_pct',
+      'last_funding_cumulative', 'last_funding_alert_at',
     ]);
 
     const entries = Object.entries(updates).filter(([key]) => key !== 'id');
