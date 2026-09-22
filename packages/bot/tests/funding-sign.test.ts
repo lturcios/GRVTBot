@@ -218,7 +218,20 @@ describe('backfillFundingHistory — one-time rebuild', () => {
 
     expect(client.getFundingPayments).not.toHaveBeenCalled();
     expect(mockDb.insertFundingPayment).not.toHaveBeenCalled();
-    expect(mockDb.deleteLegacyFundingForBot).not.toHaveBeenCalled();
+  });
+
+  it('cleans up funding misattributed to a bot that never traded', async () => {
+    // Observed in production: the old model copied the sub-account cumulative
+    // onto bots 3 and 4, which never placed an order, leaving -2.369793 on
+    // each. Skipping them must not mean leaving that behind.
+    mockDb.countFillsForBot.mockResolvedValue(0);
+    mockDb.deleteLegacyFundingForBot.mockResolvedValue(4);
+    const { engine } = engineWith([payment(-0.028144, '195951743')]);
+
+    await (engine as any).backfillFundingHistory();
+
+    expect(mockDb.deleteLegacyFundingForBot).toHaveBeenCalledWith(5);
+    expect(mockDb.insertFundingPayment).not.toHaveBeenCalled();
   });
 
   it('does NOT purge when GRVT returns nothing — a failed fetch must not empty the table', async () => {

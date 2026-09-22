@@ -1701,6 +1701,19 @@ export class GridEngine extends EventEmitter {
           // nothing rather than a copy of a sibling's cost.
           const fills = await db.countFillsForBot(bot.id);
           if (fills === 0) {
+            // No fills ⇒ no position ⇒ no funding ever accrued. Any rows this
+            // bot holds came from the old model, which copied the SUB-ACCOUNT
+            // cumulative onto every bot regardless of whether it traded — this
+            // deployment had the account total sitting on two bots that never
+            // placed an order. Only NULL-tx_id rows are dropped; a real
+            // settlement is never deleted on an inference.
+            const removed = await db.deleteLegacyFundingForBot(bot.id);
+            if (removed > 0) {
+              log.warn(
+                { botId: bot.id, removed },
+                'funding cleanup: dropped rows misattributed to a bot that never traded'
+              );
+            }
             log.info(`🔄 [DEBUG] Bot ${bot.id} (${bot.pair}): sin fills, no le corresponde funding`);
             continue;
           }
